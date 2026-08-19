@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolCall } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
@@ -478,6 +478,33 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 	const resolvedAgentDir = resolvePath(agentDir);
 	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 	return join(resolvedAgentDir, "sessions", safePath);
+}
+
+/**
+ * Find tool calls that never received a result. A crash between an assistant's
+ * tool call and its result leaves the call dangling; each must be settled before
+ * the turn can continue, or the provider rejects the next request.
+ */
+export function findDanglingToolCalls(messages: readonly AgentMessage[]): AgentToolCall[] {
+	const resolved = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "toolResult") {
+			resolved.add(message.toolCallId);
+		}
+	}
+
+	const dangling: AgentToolCall[] = [];
+	for (const message of messages) {
+		if (message.role !== "assistant") {
+			continue;
+		}
+		for (const block of message.content) {
+			if (block.type === "toolCall" && !resolved.has(block.id)) {
+				dangling.push(block);
+			}
+		}
+	}
+	return dangling;
 }
 
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {

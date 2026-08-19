@@ -24,6 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import { createErrorToolResult, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -102,7 +103,12 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	findDanglingToolCalls,
+	getLatestCompactionEntry,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -1072,12 +1078,82 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._drive(() => this.agent.prompt(messages));
+	}
+
+	// Shared run scaffolding: mark the session active, run the initial action, then
+	// keep continuing while post-run handling (retries, compaction, queued messages)
+	// asks for another pass, and always settle at the end.
+	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
+	/**
+	 * Finish a turn that was interrupted mid-step. If the transcript holds tool
+	 * calls with no result (a crash between a tool call and its result), settle each
+	 * as a failed toolResult, persist it, and drive the loop to completion. If the
+	 * transcript instead ends in an unanswered user or tool-result message, just
+	 * drive it. A no-op when nothing is in flight. The user prompt is never re-added,
+	 * so a completed prompt is not re-run. Returns whether it drove a run.
+	 */
+	async resumeInterruptedTurn(): Promise<boolean> {
+		if (this._isAgentRunActive) {
+			return false;
+		}
+
+		const messages = this.agent.state.messages;
+		if (messages.length === 0) {
+			return false;
+		}
+
+		const dangling = findDanglingToolCalls(messages);
+		if (dangling.length > 0) {
+			for (const toolCall of dangling) {
+				const toolResult = createToolResultMessage({
+					toolCall,
+					result: createErrorToolResult(
+						"This tool call did not finish before the session was interrupted. Treat it as failed and decide how to proceed.",
+					),
+					isError: true,
+				});
+				this.agent.state.messages = [...this.agent.state.messages, toolResult];
+				this.sessionManager.appendMessage(toolResult);
+			}
+			await this._drive(() => this.agent.continue());
+			return true;
+		}
+
+		// No dangling calls: resume only if the last message still awaits a response.
+		// A trailing assistant message means the turn already produced its answer.
+		const last = messages[messages.length - 1];
+		if (last.role === "user" || last.role === "toolResult") {
+			await this._drive(() => this.agent.continue());
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Advance the current turn by exactly one step (one model call and the tools it
+	 * requests). Unlike prompt(), it adds no message and does not loop; the caller
+	 * drives successive steps. The last recorded message must be a user or
+	 * tool-result message; repair a dangling tool call with resumeInterruptedTurn first.
+	 */
+	async step(): Promise<void> {
+		this._isAgentRunActive = true;
+		try {
+			await this.agent.step();
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
