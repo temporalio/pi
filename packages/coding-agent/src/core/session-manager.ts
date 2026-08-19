@@ -481,30 +481,26 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 }
 
 /**
- * Find tool calls that never received a result. A crash between an assistant's
- * tool call and its result leaves the call dangling; each must be settled before
- * the turn can continue, or the provider rejects the next request.
+ * Find the unsettled tool calls of an interrupted turn. `Agent.continue()` refuses a
+ * trailing assistant message, so a turn that stopped between a tool call and its result
+ * can't be finished until each call is settled. Settling them in the transcript also
+ * keeps the record readable on its own, instead of each request having to synthesize
+ * the missing results again.
+ *
+ * Only the trailing assistant message counts. An aborted tool batch leaves older calls
+ * unresolved on purpose, and a result appended at the tail for one of those attaches to
+ * the wrong call. Errored and aborted messages are skipped because the provider never
+ * sees them, so a result for their calls has nothing to pair with.
  */
 export function findDanglingToolCalls(messages: readonly AgentMessage[]): AgentToolCall[] {
-	const resolved = new Set<string>();
-	for (const message of messages) {
-		if (message.role === "toolResult") {
-			resolved.add(message.toolCallId);
-		}
+	const last = messages[messages.length - 1];
+	if (!last || last.role !== "assistant") {
+		return [];
 	}
-
-	const dangling: AgentToolCall[] = [];
-	for (const message of messages) {
-		if (message.role !== "assistant") {
-			continue;
-		}
-		for (const block of message.content) {
-			if (block.type === "toolCall" && !resolved.has(block.id)) {
-				dangling.push(block);
-			}
-		}
+	if (last.stopReason === "error" || last.stopReason === "aborted") {
+		return [];
 	}
-	return dangling;
+	return last.content.filter((block) => block.type === "toolCall");
 }
 
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
