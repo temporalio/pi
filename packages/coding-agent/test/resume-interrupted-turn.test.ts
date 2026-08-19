@@ -1,13 +1,16 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	EventStream,
 	getModel,
+	type Message,
 	type ToolResultMessage,
+	type UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
@@ -67,8 +70,33 @@ function toolResult(toolCallId: string, text: string, isError: boolean): ToolRes
 	};
 }
 
-function user(text: string): AgentMessage {
+function user(text: string): UserMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+}
+
+/** Every tool result must follow the assistant message that asked for it, exactly once. */
+function assertValidToolPairing(messages: AgentMessage[]): void {
+	const model = getModel("anthropic", "claude-sonnet-4-5")!;
+	const payload = transformMessages(messages as Message[], model);
+	const seen = new Set<string>();
+	for (let i = 0; i < payload.length; i++) {
+		const message = payload[i];
+		if (message.role !== "toolResult") {
+			continue;
+		}
+		expect(seen.has(message.toolCallId)).toBe(false);
+		seen.add(message.toolCallId);
+
+		let owner = i - 1;
+		while (owner >= 0 && payload[owner].role === "toolResult") {
+			owner--;
+		}
+		const asking = payload[owner];
+		expect(asking?.role).toBe("assistant");
+		const calls = asking?.role === "assistant" ? asking.content : [];
+		const ids = calls.filter((b) => b.type === "toolCall").map((b) => b.id);
+		expect(ids).toContain(message.toolCallId);
+	}
 }
 
 describe("findDanglingToolCalls", () => {
@@ -94,7 +122,7 @@ describe("findDanglingToolCalls", () => {
 		expect(findDanglingToolCalls(messages).map((c) => c.id)).toEqual(["t1"]);
 	});
 
-	it("finds multiple dangling calls across messages, ignoring resolved ones", () => {
+	it("finds every call of the trailing assistant message", () => {
 		const messages: AgentMessage[] = [
 			user("go"),
 			assistant(
@@ -104,19 +132,47 @@ describe("findDanglingToolCalls", () => {
 				],
 				"toolUse",
 			),
-			toolResult("t1", "done", false),
-			assistant([{ type: "toolCall", id: "t3", name: "do", arguments: {} }], "toolUse"),
 		];
-		expect(findDanglingToolCalls(messages).map((c) => c.id)).toEqual(["t2", "t3"]);
+		expect(findDanglingToolCalls(messages).map((c) => c.id)).toEqual(["t1", "t2"]);
+	});
+
+	it("leaves an unresolved call from earlier history alone", () => {
+		// An aborted tool batch leaves calls open on purpose. A result appended at the
+		// tail would attach to the wrong call.
+		const messages: AgentMessage[] = [
+			user("go"),
+			assistant([{ type: "toolCall", id: "old", name: "do", arguments: {} }], "toolUse"),
+			user("never mind, do this instead"),
+			assistant([{ type: "text", text: "sure" }]),
+		];
+		expect(findDanglingToolCalls(messages)).toEqual([]);
+	});
+
+	it("skips an aborted assistant message", () => {
+		const messages: AgentMessage[] = [
+			user("go"),
+			assistant([{ type: "toolCall", id: "t1", name: "do", arguments: {} }], "aborted"),
+		];
+		expect(findDanglingToolCalls(messages)).toEqual([]);
+	});
+
+	it("skips an errored assistant message", () => {
+		const messages: AgentMessage[] = [
+			user("go"),
+			assistant([{ type: "toolCall", id: "t1", name: "do", arguments: {} }], "error"),
+		];
+		expect(findDanglingToolCalls(messages)).toEqual([]);
 	});
 });
 
 describe("AgentSession.resumeInterruptedTurn", () => {
 	let session: AgentSession;
 	let tempDir: string;
+	let sessionManager: SessionManager;
 
 	beforeEach(() => {
-		tempDir = join(tmpdir(), `pi-resume-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const unique = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		tempDir = join(tmpdir(), `pi-resume-test-${unique}`);
 		mkdirSync(tempDir, { recursive: true });
 	});
 
@@ -125,7 +181,21 @@ describe("AgentSession.resumeInterruptedTurn", () => {
 		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 	});
 
-	async function createSession(): Promise<AgentSession> {
+	/** Messages as the session file holds them, so persistence is covered too. */
+	function persistedMessages(): AgentMessage[] {
+		const file = sessionManager.getSessionFile();
+		if (!file || !existsSync(file)) {
+			return [];
+		}
+		return readFileSync(file, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line))
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.message as AgentMessage);
+	}
+
+	async function createSession(reply = "all handled"): Promise<AgentSession> {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -136,14 +206,14 @@ describe("AgentSession.resumeInterruptedTurn", () => {
 					stream.push({
 						type: "done",
 						reason: "stop",
-						message: assistant([{ type: "text", text: "all handled" }]),
+						message: assistant([{ type: "text", text: reply }]),
 					});
 				});
 				return stream;
 			},
 		});
 
-		const sessionManager = SessionManager.inMemory();
+		sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
@@ -160,11 +230,56 @@ describe("AgentSession.resumeInterruptedTurn", () => {
 		return session;
 	}
 
-	it("repairs a dangling tool call and drives the turn to completion", async () => {
-		await createSession();
+	/** Seed both memory and the file, the way a crashed run leaves them. */
+	function seed(messages: (UserMessage | AssistantMessage | ToolResultMessage)[]): void {
+		session.agent.state.messages = messages;
+		for (const message of messages) {
+			sessionManager.appendMessage(message);
+		}
+	}
 
-		// A crash left one tool call answered and one dangling.
-		session.agent.state.messages = [
+	it("settles the calls of an interrupted turn and drives it to completion", async () => {
+		await createSession();
+		seed([
+			user("do two things"),
+			assistant(
+				[
+					{ type: "toolCall", id: "hang-1", name: "do", arguments: {} },
+					{ type: "toolCall", id: "hang-2", name: "do", arguments: {} },
+				],
+				"toolUse",
+			),
+		]);
+
+		const drove = await session.resumeInterruptedTurn();
+		expect(drove).toBe(true);
+		expect(session.isIdle).toBe(true);
+
+		const messages = session.agent.state.messages;
+
+		// The prompt was not added again.
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+
+		// Both calls are settled, and the turn produced a final answer.
+		const settled = messages.filter((m) => m.role === "toolResult") as ToolResultMessage[];
+		expect(settled.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+		expect(settled.every((m) => m.isError)).toBe(true);
+		expect(findDanglingToolCalls(messages)).toEqual([]);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "all handled" });
+
+		// The settled results reached the session file, not just memory.
+		const written = persistedMessages().filter((m) => m.role === "toolResult");
+		const persisted = written as ToolResultMessage[];
+		expect(persisted.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+
+		// The repaired transcript is a payload a provider accepts.
+		assertValidToolPairing(messages);
+	});
+
+	it("keeps a result that landed before the interruption", async () => {
+		await createSession();
+		seed([
 			user("do two things"),
 			assistant(
 				[
@@ -174,43 +289,118 @@ describe("AgentSession.resumeInterruptedTurn", () => {
 				"toolUse",
 			),
 			toolResult("done-1", "did done-1", false),
-		];
+		]);
 
-		const drove = await session.resumeInterruptedTurn();
-		expect(drove).toBe(true);
-		expect(session.isIdle).toBe(true);
+		expect(await session.resumeInterruptedTurn()).toBe(true);
 
 		const messages = session.agent.state.messages;
+		const kept = messages.find((m) => m.role === "toolResult" && m.toolCallId === "done-1");
+		const completed = kept as ToolResultMessage;
+		expect(completed.isError).toBe(false);
+		expect(completed.content?.[0]).toMatchObject({ type: "text", text: "did done-1" });
 
-		// The prompt was not re-added.
+		// The turn finished, and the payload stays valid for the provider.
+		expect(messages[messages.length - 1].role).toBe("assistant");
+		assertValidToolPairing(messages);
+	});
+
+	it("resumes after an aborted assistant message", async () => {
+		await createSession();
+		seed([user("go"), assistant([{ type: "text", text: "" }], "aborted")]);
+
+		expect(await session.resumeInterruptedTurn()).toBe(true);
+
+		const messages = session.agent.state.messages;
 		expect(messages.filter((m) => m.role === "user").length).toBe(1);
-
-		// The completed tool result is kept as-is.
-		const completed = messages.find((m) => m.role === "toolResult" && m.toolCallId === "done-1") as
-			| ToolResultMessage
-			| undefined;
-		expect(completed?.isError).toBe(false);
-		expect(completed?.content?.[0]).toMatchObject({ type: "text", text: "did done-1" });
-
-		// The dangling call is now settled as a failed result.
-		const repaired = messages.find((m) => m.role === "toolResult" && m.toolCallId === "hang-1") as
-			| ToolResultMessage
-			| undefined;
-		expect(repaired?.isError).toBe(true);
-
-		// No tool call is left dangling, and the turn produced a final answer.
-		expect(findDanglingToolCalls(messages)).toEqual([]);
 		const last = messages[messages.length - 1];
-		expect(last.role).toBe("assistant");
-		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "all handled" });
+		expect(last.role === "assistant" && last.stopReason).toBe("stop");
+	});
+
+	it("settles a call only once when it runs again", async () => {
+		await createSession();
+		const call = { type: "toolCall" as const, id: "hang-1", name: "do", arguments: {} };
+		seed([user("go"), assistant([call], "toolUse")]);
+
+		expect(await session.resumeInterruptedTurn()).toBe(true);
+		const settledOnce = session.agent.state.messages.filter((m) => m.role === "toolResult");
+
+		expect(await session.resumeInterruptedTurn()).toBe(false);
+		const settledAgain = session.agent.state.messages.filter((m) => m.role === "toolResult");
+		expect(settledAgain.length).toBe(settledOnce.length);
 	});
 
 	it("is a no-op when the turn already finished", async () => {
 		await createSession();
-		session.agent.state.messages = [user("hi"), assistant([{ type: "text", text: "done" }])];
+		seed([user("hi"), assistant([{ type: "text", text: "done" }])]);
 
-		const drove = await session.resumeInterruptedTurn();
-		expect(drove).toBe(false);
+		expect(await session.resumeInterruptedTurn()).toBe(false);
 		expect(session.agent.state.messages.length).toBe(2);
+	});
+});
+
+describe("AgentSession.step", () => {
+	let session: AgentSession;
+	let tempDir: string;
+
+	beforeEach(() => {
+		const unique = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		tempDir = join(tmpdir(), `pi-step-test-${unique}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		if (session) session.dispose();
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+	});
+
+	async function createSession(replies: AssistantMessage[]): Promise<AgentSession> {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let call = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				const message = replies[Math.min(call, replies.length - 1)];
+				call++;
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRuntime: getModelRuntime(modelRegistry),
+			resourceLoader: createTestResourceLoader(),
+		});
+		return session;
+	}
+
+	it("reports done when the turn produced its answer", async () => {
+		await createSession([assistant([{ type: "text", text: "answer" }])]);
+		session.agent.state.messages = [user("go")];
+
+		expect(await session.step()).toEqual({ done: true });
+	});
+
+	it("keeps retry handling, so a transient provider error asks for another step", async () => {
+		const failed = assistant([{ type: "text", text: "" }], "error");
+		failed.errorMessage = "overloaded";
+		await createSession([failed, assistant([{ type: "text", text: "answer" }])]);
+		session.agent.state.messages = [user("go")];
+
+		// Post-run handling owns the retry, so the step must not report itself finished.
+		expect(await session.step()).toEqual({ done: false });
 	});
 });
