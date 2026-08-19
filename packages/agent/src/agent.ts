@@ -7,7 +7,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { runAgentLoop, runAgentLoopContinue, runAgentStep } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -387,6 +387,27 @@ export class Agent {
 		await this.runContinuation();
 	}
 
+	/**
+	 * Advance the current transcript by exactly one step (one model call and the
+	 * tools it requests). Adds no message and does not loop. The last message must
+	 * be a user or tool-result message.
+	 */
+	async step(): Promise<void> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		const lastMessage = this._state.messages[this._state.messages.length - 1];
+		if (!lastMessage) {
+			throw new Error("No messages to step from");
+		}
+		if (lastMessage.role === "assistant") {
+			throw new Error("Cannot step from message role: assistant");
+		}
+
+		await this.runSingleStep();
+	}
+
 	private normalizePromptInput(
 		input: string | AgentMessage | AgentMessage[],
 		images?: ImageContent[],
@@ -425,6 +446,18 @@ export class Agent {
 	private async runContinuation(): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoopContinue(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+	}
+
+	private async runSingleStep(): Promise<void> {
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentStep(
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
 				(event) => this.processEvents(event),

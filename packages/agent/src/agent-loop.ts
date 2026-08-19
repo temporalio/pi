@@ -142,11 +142,203 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+/**
+ * Run exactly one iteration of the loop against the current context, adding no
+ * new message. Like agentLoopContinue, the last message must convert to a `user`
+ * or `toolResult` message. Used to drive a turn one step at a time from outside.
+ */
+export function agentStep(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): EventStream<AgentEvent, AgentMessage[]> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot step from message role: assistant");
+	}
+
+	const stream = createAgentStream();
+
+	void runAgentStep(
+		context,
+		config,
+		async (event) => {
+			stream.push(event);
+		},
+		signal,
+		streamFn,
+	).then((messages) => {
+		stream.end(messages);
+	});
+
+	return stream;
+}
+
+export async function runAgentStep(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentMessage[]> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot step from message role: assistant");
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context };
+
+	await emit({ type: "agent_start" });
+	await emit({ type: "turn_start" });
+
+	const outcome = await runSingleTurn({
+		context: currentContext,
+		config,
+		newMessages,
+		pendingMessages: [],
+		emitTurnStart: false,
+		fetchNextPending: false,
+		signal,
+		emit,
+		streamFunction: streamFn ?? getDefaultStreamFn(),
+	});
+
+	if (!outcome.done) {
+		await emit({ type: "agent_end", messages: newMessages });
+	}
+
+	return newMessages;
+}
+
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+export interface SingleTurnParams {
+	context: AgentContext;
+	config: AgentLoopConfig;
+	newMessages: AgentMessage[];
+	pendingMessages: AgentMessage[];
+	// The first iteration of a run does not emit turn_start; the run entry point
+	// already emitted it.
+	emitTurnStart: boolean;
+	// Whether to drain the steering queue after the turn. A one-shot step leaves
+	// the queues to the caller instead of consuming a message it will not run.
+	fetchNextPending: boolean;
+	signal: AbortSignal | undefined;
+	emit: AgentEventSink;
+	streamFunction: StreamFn;
+}
+
+export interface SingleTurnOutcome {
+	// True once agent_end has been emitted (an error/abort or a stop decision); the
+	// caller must return without emitting agent_end again.
+	done: boolean;
+	hasMoreToolCalls: boolean;
+	context: AgentContext;
+	config: AgentLoopConfig;
+	pendingMessages: AgentMessage[];
+}
+
+/**
+ * One iteration of the agent loop: inject any pending messages, stream a single
+ * assistant response, run the tools it requests, and report whether the loop
+ * should keep going. Extracted from runLoop so a step can be driven on its own.
+ */
+export async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
+	const { newMessages, signal, emit, streamFunction } = params;
+	let currentContext = params.context;
+	let config = params.config;
+
+	if (params.emitTurnStart) {
+		await emit({ type: "turn_start" });
+	}
+
+	if (params.pendingMessages.length > 0) {
+		for (const message of params.pendingMessages) {
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
+	}
+
+	const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+	newMessages.push(message);
+
+	if (message.stopReason === "error" || message.stopReason === "aborted") {
+		await emit({ type: "turn_end", message, toolResults: [] });
+		await emit({ type: "agent_end", messages: newMessages });
+		return { done: true, hasMoreToolCalls: false, context: currentContext, config, pendingMessages: [] };
+	}
+
+	const toolCalls = message.content.filter((c) => c.type === "toolCall");
+
+	const toolResults: ToolResultMessage[] = [];
+	let hasMoreToolCalls = false;
+	if (toolCalls.length > 0) {
+		// A "length" stop means the output was cut off by the token limit, so
+		// every tool call in the message may carry truncated arguments. Fail
+		// them all instead of executing potentially borked calls.
+		const executedToolBatch =
+			message.stopReason === "length"
+				? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+				: await executeToolCalls(currentContext, message, config, signal, emit);
+		toolResults.push(...executedToolBatch.messages);
+		hasMoreToolCalls = !executedToolBatch.terminate;
+
+		for (const result of toolResults) {
+			currentContext.messages.push(result);
+			newMessages.push(result);
+		}
+	}
+
+	await emit({ type: "turn_end", message, toolResults });
+
+	const nextTurnContext = {
+		message,
+		toolResults,
+		context: currentContext,
+		newMessages,
+	};
+	const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
+	if (nextTurnSnapshot) {
+		currentContext = nextTurnSnapshot.context ?? currentContext;
+		config = {
+			...config,
+			model: nextTurnSnapshot.model ?? config.model,
+			reasoning:
+				nextTurnSnapshot.thinkingLevel === undefined
+					? config.reasoning
+					: nextTurnSnapshot.thinkingLevel === "off"
+						? undefined
+						: nextTurnSnapshot.thinkingLevel,
+		};
+	}
+
+	if (
+		await config.shouldStopAfterTurn?.({
+			message,
+			toolResults,
+			context: currentContext,
+			newMessages,
+		})
+	) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return { done: true, hasMoreToolCalls, context: currentContext, config, pendingMessages: [] };
+	}
+
+	const pendingMessages = params.fetchNextPending ? (await config.getSteeringMessages?.()) || [] : [];
+	return { done: false, hasMoreToolCalls, context: currentContext, config, pendingMessages };
 }
 
 /**
@@ -172,91 +364,25 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (!firstTurn) {
-				await emit({ type: "turn_start" });
-			} else {
-				firstTurn = false;
-			}
-
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
-			}
-
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
-			newMessages.push(message);
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
-			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				// A "length" stop means the output was cut off by the token limit, so
-				// every tool call in the message may carry truncated arguments. Fail
-				// them all instead of executing potentially borked calls.
-				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults });
-
-			const nextTurnContext = {
-				message,
-				toolResults,
+			const outcome = await runSingleTurn({
 				context: currentContext,
+				config,
 				newMessages,
-			};
-			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
-				config = {
-					...config,
-					model: nextTurnSnapshot.model ?? config.model,
-					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
-							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
-								? undefined
-								: nextTurnSnapshot.thinkingLevel,
-				};
-			}
-
-			if (
-				await config.shouldStopAfterTurn?.({
-					message,
-					toolResults,
-					context: currentContext,
-					newMessages,
-				})
-			) {
-				await emit({ type: "agent_end", messages: newMessages });
+				pendingMessages,
+				emitTurnStart: !firstTurn,
+				fetchNextPending: true,
+				signal,
+				emit,
+				streamFunction,
+			});
+			firstTurn = false;
+			if (outcome.done) {
 				return;
 			}
-
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			hasMoreToolCalls = outcome.hasMoreToolCalls;
+			currentContext = outcome.context;
+			config = outcome.config;
+			pendingMessages = outcome.pendingMessages;
 		}
 
 		// Agent would stop here. Check for follow-up messages.
@@ -571,7 +697,7 @@ type ExecutedToolCallOutcome = {
 	isError: boolean;
 };
 
-type FinalizedToolCallOutcome = {
+export type FinalizedToolCallOutcome = {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
@@ -757,7 +883,7 @@ async function finalizeExecutedToolCall(
 	};
 }
 
-function createErrorToolResult(message: string): AgentToolResult<any> {
+export function createErrorToolResult(message: string): AgentToolResult<any> {
 	return {
 		content: [{ type: "text", text: message }],
 		details: {},
@@ -774,7 +900,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 	});
 }
 
-function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+export function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
