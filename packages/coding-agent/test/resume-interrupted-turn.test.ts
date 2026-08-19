@@ -407,3 +407,131 @@ describe("AgentSession.step", () => {
 		expect(await session.step()).toEqual({ done: false });
 	});
 });
+
+describe("AgentSession stepped turns", () => {
+	let session: AgentSession;
+	let sessionManager: SessionManager;
+	let tempDir: string;
+	let modelCalls: number;
+
+	beforeEach(() => {
+		const unique = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		tempDir = join(tmpdir(), `pi-stepped-test-${unique}`);
+		mkdirSync(tempDir, { recursive: true });
+		modelCalls = 0;
+	});
+
+	afterEach(() => {
+		if (session) session.dispose();
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+	});
+
+	async function createSession(replies: AssistantMessage[]): Promise<AgentSession> {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				const message = replies[Math.min(modelCalls, replies.length - 1)];
+				modelCalls++;
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+
+		sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRuntime: getModelRuntime(modelRegistry),
+			resourceLoader: createTestResourceLoader(),
+		});
+		return session;
+	}
+
+	function persisted(): AgentMessage[] {
+		const file = sessionManager.getSessionFile();
+		if (!file || !existsSync(file)) {
+			return [];
+		}
+		return readFileSync(file, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line))
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.message as AgentMessage);
+	}
+
+	/** Seed both memory and the file, the way a crashed run leaves them. */
+	function seed(messages: (UserMessage | AssistantMessage | ToolResultMessage)[]): void {
+		session.agent.state.messages = messages;
+		for (const message of messages) {
+			sessionManager.appendMessage(message);
+		}
+	}
+
+	it("records a prompt without calling the model, and step runs it", async () => {
+		await createSession([assistant([{ type: "text", text: "answer" }])]);
+
+		expect(await session.recordPrompt("go")).toBe(true);
+		expect(modelCalls).toBe(0);
+		expect(session.agent.state.messages.map((m) => m.role)).toEqual(["user"]);
+
+		expect(await session.step()).toEqual({ done: true });
+		expect(modelCalls).toBe(1);
+
+		const messages = session.agent.state.messages;
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "answer" });
+
+		// The turn is on disk, so the next step can run in another process.
+		expect(persisted().map((m) => m.role)).toEqual(["user", "assistant"]);
+	});
+
+	it("settles an interrupted turn without calling the model, then steps", async () => {
+		await createSession([assistant([{ type: "text", text: "all handled" }])]);
+		seed([user("go"), assistant([{ type: "toolCall", id: "hang-1", name: "do", arguments: {} }], "toolUse")]);
+
+		expect(session.prepareStep()).toBe(true);
+		expect(modelCalls).toBe(0);
+
+		const settled = session.agent.state.messages.filter((m) => m.role === "toolResult") as ToolResultMessage[];
+		expect(settled.map((m) => m.toolCallId)).toEqual(["hang-1"]);
+		expect(settled[0].isError).toBe(true);
+		expect(persisted().filter((m) => m.role === "toolResult").length).toBe(1);
+
+		expect(await session.step()).toEqual({ done: true });
+		expect(modelCalls).toBe(1);
+		expect(session.agent.state.messages.filter((m) => m.role === "user").length).toBe(1);
+		assertValidToolPairing(session.agent.state.messages);
+	});
+
+	it("reports a finished turn as nothing to step", async () => {
+		await createSession([assistant([{ type: "text", text: "answer" }])]);
+		seed([user("hi"), assistant([{ type: "text", text: "done" }])]);
+
+		expect(session.prepareStep()).toBe(false);
+		expect(modelCalls).toBe(0);
+		expect(session.agent.state.messages.length).toBe(2);
+	});
+
+	it("settles a call once, however many times the driver asks", async () => {
+		await createSession([assistant([{ type: "text", text: "all handled" }])]);
+		seed([user("go"), assistant([{ type: "toolCall", id: "hang-1", name: "do", arguments: {} }], "toolUse")]);
+
+		expect(session.prepareStep()).toBe(true);
+		expect(session.prepareStep()).toBe(true);
+		expect(session.agent.state.messages.filter((m) => m.role === "toolResult").length).toBe(1);
+	});
+});
