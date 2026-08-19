@@ -142,17 +142,26 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+export interface AgentStepOutcome {
+	messages: AgentMessage[];
+	/** True when the turn ran tools whose results still need another step. */
+	hasMoreToolCalls: boolean;
+}
+
 /**
  * Run exactly one iteration of the loop against the current context, adding no
  * new message. Like agentLoopContinue, the last message must convert to a `user`
  * or `toolResult` message. Used to drive a turn one step at a time from outside.
+ *
+ * A step is one turn, not a whole run, so it emits no `agent_start`. The run ends
+ * only when the turn itself ends it, on an error, an abort, or a stop decision.
  */
 export function agentStep(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
-): EventStream<AgentEvent, AgentMessage[]> {
+): EventStream<AgentEvent, AgentStepOutcome> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot step: no messages in context");
 	}
@@ -160,7 +169,12 @@ export function agentStep(
 		throw new Error("Cannot step from message role: assistant");
 	}
 
-	const stream = createAgentStream();
+	// A step has no single terminating event, so the stream closes when the step
+	// resolves. That also carries the outcome, which no event holds.
+	const stream = new EventStream<AgentEvent, AgentStepOutcome>(
+		() => false,
+		() => ({ messages: [], hasMoreToolCalls: false }),
+	);
 
 	void runAgentStep(
 		context,
@@ -170,8 +184,8 @@ export function agentStep(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
+	).then((outcome) => {
+		stream.end(outcome);
 	});
 
 	return stream;
@@ -183,7 +197,7 @@ export async function runAgentStep(
 	emit: AgentEventSink,
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
-): Promise<AgentMessage[]> {
+): Promise<AgentStepOutcome> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot step: no messages in context");
 	}
@@ -194,26 +208,19 @@ export async function runAgentStep(
 	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext = { ...context };
 
-	await emit({ type: "agent_start" });
-	await emit({ type: "turn_start" });
-
 	const outcome = await runSingleTurn({
 		context: currentContext,
 		config,
 		newMessages,
 		pendingMessages: [],
-		emitTurnStart: false,
+		emitTurnStart: true,
 		fetchNextPending: false,
 		signal,
 		emit,
 		streamFunction: streamFn ?? getDefaultStreamFn(),
 	});
 
-	if (!outcome.done) {
-		await emit({ type: "agent_end", messages: newMessages });
-	}
-
-	return newMessages;
+	return { messages: newMessages, hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls };
 }
 
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
@@ -223,7 +230,7 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-export interface SingleTurnParams {
+interface SingleTurnParams {
 	context: AgentContext;
 	config: AgentLoopConfig;
 	newMessages: AgentMessage[];
@@ -239,7 +246,7 @@ export interface SingleTurnParams {
 	streamFunction: StreamFn;
 }
 
-export interface SingleTurnOutcome {
+interface SingleTurnOutcome {
 	// True once agent_end has been emitted (an error/abort or a stop decision); the
 	// caller must return without emitting agent_end again.
 	done: boolean;
@@ -252,9 +259,9 @@ export interface SingleTurnOutcome {
 /**
  * One iteration of the agent loop: inject any pending messages, stream a single
  * assistant response, run the tools it requests, and report whether the loop
- * should keep going. Extracted from runLoop so a step can be driven on its own.
+ * should keep going.
  */
-export async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
+async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
 	const { newMessages, signal, emit, streamFunction } = params;
 	let currentContext = params.context;
 	let config = params.config;
@@ -697,7 +704,7 @@ type ExecutedToolCallOutcome = {
 	isError: boolean;
 };
 
-export type FinalizedToolCallOutcome = {
+type FinalizedToolCallOutcome = {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
@@ -883,7 +890,7 @@ async function finalizeExecutedToolCall(
 	};
 }
 
-export function createErrorToolResult(message: string): AgentToolResult<any> {
+function createErrorToolResult(message: string): AgentToolResult<any> {
 	return {
 		content: [{ type: "text", text: message }],
 		details: {},
@@ -900,7 +907,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 	});
 }
 
-export function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
