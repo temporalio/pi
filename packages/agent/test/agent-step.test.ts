@@ -123,19 +123,23 @@ describe("agentStep", () => {
 		for await (const event of stream) {
 			events.push(event);
 		}
-		const messages = await stream.result();
+		const outcome = await stream.result();
 
 		// Exactly one model call, and the tool it requested ran once.
 		expect(callCount).toBe(1);
 		expect(executed).toEqual(["x"]);
 
-		// Exactly one step: one turn boundary, then the run ends.
+		// One turn boundary. A step is a turn, so it opens no run of its own.
 		expect(events.filter((e) => e.type === "turn_start").length).toBe(1);
 		expect(events.filter((e) => e.type === "turn_end").length).toBe(1);
-		expect(events.filter((e) => e.type === "agent_end").length).toBe(1);
+		expect(events.filter((e) => e.type === "agent_start").length).toBe(0);
+		expect(events.filter((e) => e.type === "agent_end").length).toBe(0);
+
+		// The tool result still needs an answer, so the caller has to step again.
+		expect(outcome.hasMoreToolCalls).toBe(true);
 
 		// The step produced the assistant message and its tool result, and nothing more.
-		expect(messages.map((m) => m.role)).toEqual(["assistant", "toolResult"]);
+		expect(outcome.messages.map((m) => m.role)).toEqual(["assistant", "toolResult"]);
 	});
 
 	it("throws when the last message is an assistant", () => {
