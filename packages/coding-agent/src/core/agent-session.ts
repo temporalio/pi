@@ -24,7 +24,6 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { createErrorToolResult, createToolResultMessage } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -33,6 +32,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -309,6 +309,12 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // Constants
 // ============================================================================
 
+// The tool can have run before the session stopped, so the model is told the outcome
+// is unknown. "Failed" would invite a second run of an effect that already happened.
+const INTERRUPTED_TOOL_CALL_RESULT =
+	"The outcome of this tool call is unknown. The session stopped after the call started " +
+	"but before the result was recorded. It can have taken effect. Check the current state " +
+	"before you try again.";
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -1081,9 +1087,6 @@ export class AgentSession {
 		await this._drive(() => this.agent.prompt(messages));
 	}
 
-	// Shared run scaffolding: mark the session active, run the initial action, then
-	// keep continuing while post-run handling (retries, compaction, queued messages)
-	// asks for another pass, and always settle at the end.
 	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
@@ -1099,12 +1102,10 @@ export class AgentSession {
 	}
 
 	/**
-	 * Finish a turn that was interrupted mid-step. If the transcript holds tool
-	 * calls with no result (a crash between a tool call and its result), settle each
-	 * as a failed toolResult, persist it, and drive the loop to completion. If the
-	 * transcript instead ends in an unanswered user or tool-result message, just
-	 * drive it. A no-op when nothing is in flight. The user prompt is never re-added,
-	 * so a completed prompt is not re-run. Returns whether it drove a run.
+	 * Finish a turn that stopped part way through. Tool calls with no result are
+	 * settled first, because `continue()` refuses a trailing assistant message. The
+	 * prompt is never added again, so a finished prompt does not run twice. Returns
+	 * whether it drove a run.
 	 */
 	async resumeInterruptedTurn(): Promise<boolean> {
 		if (this._isAgentRunActive) {
@@ -1118,25 +1119,46 @@ export class AgentSession {
 
 		const dangling = findDanglingToolCalls(messages);
 		if (dangling.length > 0) {
-			for (const toolCall of dangling) {
-				const toolResult = createToolResultMessage({
-					toolCall,
-					result: createErrorToolResult(
-						"This tool call did not finish before the session was interrupted. Treat it as failed and decide how to proceed.",
-					),
-					isError: true,
-				});
-				this.agent.state.messages = [...this.agent.state.messages, toolResult];
+			const settled: ToolResultMessage[] = dangling.map((toolCall) => ({
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: INTERRUPTED_TOOL_CALL_RESULT }],
+				details: {},
+				isError: true,
+				timestamp: Date.now(),
+			}));
+
+			// The durable record comes first. If the write throws, memory must not hold a
+			// result the transcript does not, or the next resume settles the call twice.
+			for (const toolResult of settled) {
 				this.sessionManager.appendMessage(toolResult);
+				this._emit({ type: "message_start", message: toolResult });
+				this._emit({ type: "message_end", message: toolResult });
 			}
+			this.agent.state.messages = [...this.agent.state.messages, ...settled];
+
 			await this._drive(() => this.agent.continue());
 			return true;
 		}
 
-		// No dangling calls: resume only if the last message still awaits a response.
-		// A trailing assistant message means the turn already produced its answer.
 		const last = messages[messages.length - 1];
 		if (last.role === "user" || last.role === "toolResult") {
+			await this._drive(() => this.agent.continue());
+			return true;
+		}
+
+		if (last.role !== "assistant") {
+			return false;
+		}
+
+		// An errored or aborted assistant message holds no answer, and the provider
+		// never sees it. Drop it so the transcript ends where the model can pick up.
+		if (last.stopReason === "error" || last.stopReason === "aborted") {
+			this.agent.state.messages = messages.slice(0, -1);
+			if (this.agent.state.messages.length === 0) {
+				return false;
+			}
 			await this._drive(() => this.agent.continue());
 			return true;
 		}
@@ -1147,13 +1169,24 @@ export class AgentSession {
 	/**
 	 * Advance the current turn by exactly one step (one model call and the tools it
 	 * requests). Unlike prompt(), it adds no message and does not loop; the caller
-	 * drives successive steps. The last recorded message must be a user or
-	 * tool-result message; repair a dangling tool call with resumeInterruptedTurn first.
+	 * drives successive steps. The last recorded message must be a user or tool-result
+	 * message; settle a dangling tool call with resumeInterruptedTurn first.
+	 *
+	 * `done` is false while the turn needs another step, which includes a retry or a
+	 * compaction that post-run handling asked for. Steering and follow-up queues stay
+	 * untouched, so the caller decides when a queued message enters the run.
 	 */
-	async step(): Promise<void> {
+	async step(): Promise<{ done: boolean }> {
+		if (this._isAgentRunActive) {
+			return { done: false };
+		}
+
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.step();
+			const outcome = await this.agent.step();
+			// Retries and compaction live here, so a stepped run keeps both.
+			const needsAnotherPass = await this._handlePostAgentRun();
+			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
