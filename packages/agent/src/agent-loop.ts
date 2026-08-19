@@ -262,7 +262,7 @@ interface SingleTurnOutcome {
  * should keep going.
  */
 async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
-	const { newMessages, signal, emit, streamFunction } = params;
+	const { newMessages, signal, emit, streamFunction: streamFn } = params;
 	let currentContext = params.context;
 	let config = params.config;
 
@@ -279,13 +279,19 @@ async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcom
 		}
 	}
 
-	const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+	const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 	newMessages.push(message);
 
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
 		await emit({ type: "turn_end", message, toolResults: [] });
 		await emit({ type: "agent_end", messages: newMessages });
-		return { done: true, hasMoreToolCalls: false, context: currentContext, config, pendingMessages: [] };
+		return {
+			done: true,
+			hasMoreToolCalls: false,
+			context: currentContext,
+			config,
+			pendingMessages: [],
+		};
 	}
 
 	const toolCalls = message.content.filter((c) => c.type === "toolCall");
@@ -344,7 +350,8 @@ async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcom
 		return { done: true, hasMoreToolCalls, context: currentContext, config, pendingMessages: [] };
 	}
 
-	const pendingMessages = params.fetchNextPending ? (await config.getSteeringMessages?.()) || [] : [];
+	const steering = params.fetchNextPending ? await config.getSteeringMessages?.() : undefined;
+	const pendingMessages = steering || [];
 	return { done: false, hasMoreToolCalls, context: currentContext, config, pendingMessages };
 }
 

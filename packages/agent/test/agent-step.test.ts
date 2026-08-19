@@ -70,8 +70,10 @@ function createUserMessage(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
 }
 
+const LLM_ROLES = ["user", "assistant", "toolResult"];
+
 function identityConverter(messages: AgentMessage[]): Message[] {
-	return messages.filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult") as Message[];
+	return messages.filter((m) => LLM_ROLES.includes(m.role)) as Message[];
 }
 
 describe("agentStep", () => {
@@ -85,7 +87,10 @@ describe("agentStep", () => {
 			parameters: toolSchema,
 			async execute(_id, params) {
 				executed.push(params.value);
-				return { content: [{ type: "text", text: `echoed: ${params.value}` }], details: { value: params.value } };
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
 			},
 		};
 
@@ -115,7 +120,11 @@ describe("agentStep", () => {
 			return stream;
 		};
 
-		const context: AgentContext = { systemPrompt: "", messages: [createUserMessage("go")], tools: [tool] };
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [createUserMessage("go")],
+			tools: [tool],
+		};
 		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
