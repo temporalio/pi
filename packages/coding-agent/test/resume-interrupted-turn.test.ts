@@ -266,7 +266,10 @@ describe("AgentSession.resumeInterruptedTurn", () => {
 		expect(settled.every((m) => m.isError)).toBe(true);
 		expect(findDanglingToolCalls(messages)).toEqual([]);
 		const last = messages[messages.length - 1];
-		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "all handled" });
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({
+			type: "text",
+			text: "all handled",
+		});
 
 		// The settled results reached the session file, not just memory.
 		const written = persistedMessages().filter((m) => m.role === "toolResult");

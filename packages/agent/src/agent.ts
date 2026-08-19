@@ -7,12 +7,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import {
-	type AgentStepOutcome,
-	runAgentLoop,
-	runAgentLoopContinue,
-	runAgentStep,
-} from "./agent-loop.ts";
+import { type AgentStepOutcome, runAgentLoop, runAgentLoopContinue, runAgentStep } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
