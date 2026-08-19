@@ -32,6 +32,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -102,7 +103,12 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	findDanglingToolCalls,
+	getLatestCompactionEntry,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -303,6 +309,12 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // Constants
 // ============================================================================
 
+// The tool can have run before the session stopped, so the model is told the outcome
+// is unknown. "Failed" would invite a second run of an effect that already happened.
+const INTERRUPTED_TOOL_CALL_RESULT =
+	"The outcome of this tool call is unknown. The session stopped after the call started " +
+	"but before the result was recorded. It can have taken effect. Check the current state " +
+	"before you try again.";
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -649,24 +661,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
-			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._persistMessage(event.message);
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -1072,12 +1067,140 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._drive(() => this.agent.prompt(messages));
+	}
+
+	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
+	/**
+	 * Finish a turn that stopped part way through. prepareStep() settles what the stop
+	 * left behind first, because `continue()` refuses a trailing assistant message. The
+	 * prompt is never added again, so a finished prompt does not run twice. Returns
+	 * whether it drove a run.
+	 */
+	async resumeInterruptedTurn(): Promise<boolean> {
+		if (!this.prepareStep()) {
+			return false;
+		}
+
+		await this._drive(() => this.agent.continue());
+		return true;
+	}
+
+	/**
+	 * Settle what a stopped turn left behind, without calling the model: tool calls with no
+	 * result get one, and a trailing assistant message that holds no answer is dropped.
+	 * Returns whether the turn still has work, so false means it already has its answer.
+	 *
+	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller driving
+	 * step() itself wants this one, so recovery stays one step at a time.
+	 */
+	prepareStep(): boolean {
+		if (this._isAgentRunActive) {
+			return false;
+		}
+
+		const messages = this.agent.state.messages;
+		if (messages.length === 0) {
+			return false;
+		}
+
+		const dangling = findDanglingToolCalls(messages);
+		if (dangling.length > 0) {
+			const settled: ToolResultMessage[] = dangling.map((toolCall) => ({
+				role: "toolResult",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				content: [{ type: "text", text: INTERRUPTED_TOOL_CALL_RESULT }],
+				details: {},
+				isError: true,
+				timestamp: Date.now(),
+			}));
+			this._recordMessages(settled);
+			return true;
+		}
+
+		const last = messages[messages.length - 1];
+		if (last.role === "user" || last.role === "toolResult") {
+			return true;
+		}
+
+		if (last.role !== "assistant") {
+			return false;
+		}
+
+		// An errored or aborted assistant message holds no answer, and the provider
+		// never sees it. Drop it so the transcript ends where the model can pick up.
+		if (last.stopReason === "error" || last.stopReason === "aborted") {
+			this.agent.state.messages = messages.slice(0, -1);
+			return this.prepareStep();
+		}
+
+		return false;
+	}
+
+	/**
+	 * Put messages in the transcript without running anything. The durable record comes
+	 * first: if the write throws, memory must not hold a message the file does not, or the
+	 * next resume writes it a second time.
+	 */
+	private _recordMessages(messages: AgentMessage[]): void {
+		for (const message of messages) {
+			this._persistMessage(message);
+			this._emit({ type: "message_start", message });
+			this._emit({ type: "message_end", message });
+		}
+		this.agent.state.messages = [...this.agent.state.messages, ...messages];
+	}
+
+	/** Write one message to the session file, in the entry shape its role belongs in. */
+	private _persistMessage(message: AgentMessage): void {
+		if (message.role === "custom") {
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+			this.sessionManager.appendMessage(message);
+		}
+		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
+	}
+
+	/**
+	 * Advance the current turn by exactly one step (one model call and the tools it
+	 * requests). Unlike prompt(), it adds no message and does not loop; the caller
+	 * drives successive steps. The last recorded message must be a user or tool-result
+	 * message, which is what recordPrompt() and prepareStep() leave behind.
+	 *
+	 * `done` is false while the turn needs another step, which includes a retry or a
+	 * compaction that post-run handling asked for. Steering and follow-up queues stay
+	 * untouched, so the caller decides when a queued message enters the run.
+	 */
+	async step(): Promise<{ done: boolean }> {
+		if (this._isAgentRunActive) {
+			return { done: false };
+		}
+
+		this._isAgentRunActive = true;
+		try {
+			const outcome = await this.agent.step();
+			// Retries and compaction live here, so a stepped run keeps both.
+			const needsAnotherPass = await this._handlePostAgentRun();
+			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
@@ -1125,6 +1248,40 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return;
+		}
+
+		options?.preflightResult?.(true);
+		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Record a prompt without running it. Everything prompt() does to build the turn
+	 * happens here (extension input, template expansion, the model and auth checks); the
+	 * model call does not. step() picks the turn up from the transcript.
+	 *
+	 * For a caller that drives a turn one step at a time and checkpoints in between.
+	 * Returns whether a prompt was recorded: an extension command handles its own text,
+	 * and a prompt sent mid-stream is queued instead.
+	 */
+	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return false;
+		}
+
+		options?.preflightResult?.(true);
+		this._recordMessages(messages);
+		return true;
+	}
+
+	/**
+	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
+	 * when the text needed no run at all.
+	 */
+	private async _buildPromptMessages(text: string, options?: PromptOptions): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1275,12 +1432,7 @@ export class AgentSession {
 			throw error;
 		}
 
-		if (!messages) {
-			return;
-		}
-
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**

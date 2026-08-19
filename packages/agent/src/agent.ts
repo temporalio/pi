@@ -7,7 +7,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type AgentStepOutcome, runAgentLoop, runAgentLoopContinue, runAgentStep } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -387,6 +387,29 @@ export class Agent {
 		await this.runContinuation();
 	}
 
+	/**
+	 * Advance the current transcript by exactly one step (one model call and the
+	 * tools it requests). Adds no message and does not loop. The last message must
+	 * be a user or tool-result message. `hasMoreToolCalls` tells the caller whether
+	 * the turn still needs another step, so it does not repeat the loop's own
+	 * termination logic.
+	 */
+	async step(): Promise<AgentStepOutcome> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		const lastMessage = this._state.messages[this._state.messages.length - 1];
+		if (!lastMessage) {
+			throw new Error("No messages to step from");
+		}
+		if (lastMessage.role === "assistant") {
+			throw new Error("Cannot step from message role: assistant");
+		}
+
+		return await this.runSingleStep();
+	}
+
 	private normalizePromptInput(
 		input: string | AgentMessage | AgentMessage[],
 		images?: ImageContent[],
@@ -432,6 +455,22 @@ export class Agent {
 				this.streamFunction,
 			);
 		});
+	}
+
+	private async runSingleStep(): Promise<AgentStepOutcome> {
+		// A failed run is handled inside the lifecycle, so the default stands and the
+		// caller stops stepping.
+		let outcome: AgentStepOutcome = { messages: [], hasMoreToolCalls: false };
+		await this.runWithLifecycle(async (signal) => {
+			outcome = await runAgentStep(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+		return outcome;
 	}
 
 	private createContextSnapshot(): AgentContext {
