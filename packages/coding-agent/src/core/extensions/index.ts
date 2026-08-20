@@ -167,6 +167,7 @@ export type {
 	TurnEndEvent,
 	TurnExecutor,
 	TurnExecutorContext,
+	TurnExecutorOptions,
 	TurnStartEvent,
 	UIPromptEndEvent,
 	UIPromptKind,

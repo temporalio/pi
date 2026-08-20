@@ -49,6 +49,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredTool,
+	RegisteredTurnExecutor,
 	ReplacedSessionContext,
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
@@ -62,7 +63,6 @@ import type {
 	ToolCallEventResult,
 	ToolResultEvent,
 	ToolResultEventResult,
-	TurnExecutor,
 	UIPromptKind,
 	UserBashEvent,
 	UserBashEventResult,
@@ -642,7 +642,7 @@ export class ExtensionRunner {
 	}
 
 	/** The executor that runs turns, if an extension registered one. First registration wins. */
-	getTurnExecutor(): TurnExecutor | undefined {
+	getTurnExecutor(): RegisteredTurnExecutor | undefined {
 		for (const ext of this.extensions) {
 			if (ext.turnExecutor) {
 				return ext.turnExecutor;
