@@ -144,6 +144,7 @@ export type {
 	TurnEndEvent,
 	TurnExecutor,
 	TurnExecutorContext,
+	TurnExecutorOptions,
 	TurnStartEvent,
 	UserBashEvent,
 	UserBashEventResult,

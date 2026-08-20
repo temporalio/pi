@@ -127,9 +127,9 @@ describe("turn executor", () => {
 			`export default p => p.registerTurnExecutor(async t => { globalThis.turnsSeen = "first"; await t.run(); });`,
 			`export default p => p.registerTurnExecutor(async t => { globalThis.turnsSeen = "second"; await t.run(); });`,
 		);
-		const executor = runner.getTurnExecutor();
-		expect(executor).toBeDefined();
-		await executor?.({ sessionId: "s", run: async () => {} });
+		const registered = runner.getTurnExecutor();
+		expect(registered).toBeDefined();
+		await registered?.executor({ sessionId: "s", run: async () => {} });
 		expect((globalThis as any).turnsSeen).toBe("first");
 	});
 
@@ -155,6 +155,69 @@ describe("turn executor", () => {
 		expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
 		const last = messages[messages.length - 1];
 		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "answer" });
+	});
+
+	it("hands an unfinished turn to an executor that asked for it, when the session opens", async () => {
+		await createSession(
+			`export default p => p.registerTurnExecutor(
+				async turn => { globalThis.turnsSeen = (globalThis.turnsSeen ?? []).concat("resume"); await turn.run(); },
+				{ resumeOnStart: true },
+			);`,
+		);
+		const s = session as AgentSession;
+
+		// The transcript a crash mid tool call leaves behind.
+		s.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "go" }], timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "hang-1", name: "do", arguments: {} }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "mock",
+				usage,
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+		];
+
+		await s.bindExtensions({});
+		await s.waitForIdle();
+
+		expect((globalThis as any).turnsSeen).toEqual(["resume"]);
+		// The dangling call was settled and the turn ran on to an answer, without a second prompt.
+		const messages = s.agent.state.messages;
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+		expect(messages.filter((m) => m.role === "toolResult").length).toBe(1);
+		expect(messages[messages.length - 1].role).toBe("assistant");
+	});
+
+	it("leaves a finished session alone on start", async () => {
+		await createSession(
+			`export default p => p.registerTurnExecutor(
+				async turn => { globalThis.turnsSeen = "ran"; await turn.run(); },
+				{ resumeOnStart: true },
+			);`,
+		);
+		const s = session as AgentSession;
+		s.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "mock",
+				usage,
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		];
+
+		await s.bindExtensions({});
+
+		expect((globalThis as any).turnsSeen).toBeUndefined();
+		expect(modelCalls).toBe(0);
 	});
 
 	it("leaves the turn unrun when the executor never runs it", async () => {

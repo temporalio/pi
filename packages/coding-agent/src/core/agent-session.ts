@@ -1081,11 +1081,11 @@ export class AgentSession {
 		try {
 			// An extension can take over when the turn runs. It is handed the same run(), so a
 			// turn that goes through an executor and one that does not are the same turn.
-			const executor = this._extensionRunner.getTurnExecutor();
-			if (!executor) {
+			const registered = this._extensionRunner.getTurnExecutor();
+			if (!registered) {
 				await run();
 			} else {
-				await executor({ sessionId: this.sessionManager.getSessionId(), run });
+				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run });
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -2547,6 +2547,12 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+
+		// An executor that asked for it gets the turn an earlier run left unfinished. This goes
+		// through _drive, so the executor sees it as a turn like any other.
+		if (this._extensionRunner.getTurnExecutor()?.resumeOnStart) {
+			await this.resumeInterruptedTurn();
+		}
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {

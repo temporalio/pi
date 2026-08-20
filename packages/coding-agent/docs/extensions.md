@@ -1614,6 +1614,14 @@ An executor that returns without calling `run()` leaves the turn unrun, prompt i
 
 One executor wins: the first extension to register one. Register none and Pi runs turns itself, which is the default.
 
+Pass `resumeOnStart` to also be handed a turn an earlier run left unfinished, when the session opens:
+
+```typescript
+pi.registerTurnExecutor(runTurn, { resumeOnStart: true });
+```
+
+A crash during a tool call leaves the session with a tool call and no result, and Pi does not finish it on its own. With `resumeOnStart`, opening the session hands that turn to the executor: the unanswered call is settled as an unknown outcome, and the turn runs on. A session whose last turn finished is left alone. It is off by default because finishing a turn is a model call the user did not ask for in this session.
+
 This is the hook for putting the loop under something else, such as a scheduler that serialises turns across sessions, or a durable executor that records each turn and re-runs one that a crash interrupted.
 
 ### pi.registerEntryRenderer(customType, renderer)

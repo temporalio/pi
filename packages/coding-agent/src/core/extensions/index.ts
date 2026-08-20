@@ -165,6 +165,7 @@ export type {
 	TurnEndEvent,
 	TurnExecutor,
 	TurnExecutorContext,
+	TurnExecutorOptions,
 	TurnStartEvent,
 	// Events - User Bash
 	UserBashEvent,

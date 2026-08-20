@@ -1185,6 +1185,18 @@ export interface TurnExecutorContext {
  */
 export type TurnExecutor = (turn: TurnExecutorContext) => Promise<void>;
 
+export interface TurnExecutorOptions {
+	/**
+	 * Hand the executor a turn that an earlier run left unfinished, when the session opens. Off by
+	 * default, because finishing a turn is a model call the user did not ask for in this session.
+	 */
+	resumeOnStart?: boolean;
+}
+
+export interface RegisteredTurnExecutor extends TurnExecutorOptions {
+	executor: TurnExecutor;
+}
+
 export interface EntryRenderOptions {
 	expanded: boolean;
 }
@@ -1339,7 +1351,7 @@ export interface ExtensionAPI {
 	 * One executor wins: the first extension to register one. Registering none leaves pi running
 	 * turns itself, which is the default.
 	 */
-	registerTurnExecutor(executor: TurnExecutor): void;
+	registerTurnExecutor(executor: TurnExecutor, options?: TurnExecutorOptions): void;
 
 	/** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
 	registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
@@ -1752,7 +1764,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	markdownTransformer?: MarkdownTransformer;
-	turnExecutor?: TurnExecutor;
+	turnExecutor?: RegisteredTurnExecutor;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
