@@ -143,6 +143,8 @@ export type {
 	ToolRenderResultOptions,
 	ToolResultEvent,
 	TurnEndEvent,
+	TurnExecutor,
+	TurnExecutorContext,
 	TurnStartEvent,
 	UIPromptEndEvent,
 	UIPromptKind,

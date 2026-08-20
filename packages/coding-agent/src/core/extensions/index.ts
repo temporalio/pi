@@ -165,6 +165,8 @@ export type {
 	ToolResultEventResult,
 	TreePreparation,
 	TurnEndEvent,
+	TurnExecutor,
+	TurnExecutorContext,
 	TurnStartEvent,
 	UIPromptEndEvent,
 	UIPromptKind,
