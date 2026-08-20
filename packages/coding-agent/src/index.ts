@@ -142,6 +142,8 @@ export type {
 	ToolRenderResultOptions,
 	ToolResultEvent,
 	TurnEndEvent,
+	TurnExecutor,
+	TurnExecutorContext,
 	TurnStartEvent,
 	UserBashEvent,
 	UserBashEventResult,

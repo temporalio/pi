@@ -1597,6 +1597,25 @@ pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) => {
 
 If a transformer throws, Pi keeps the Markdown produced so far and continues with the next transformer. The hook is display-only: the original message remains unchanged in the session and model context. It runs for new user messages, assistant streaming updates, restored session messages, and terminal width changes, so transformers should remain synchronous and inexpensive.
 
+### pi.registerTurnExecutor(executor)
+
+Take over when a turn runs. Pi hands the executor the turn instead of running it, and the executor decides when to call `run()`.
+
+```typescript
+pi.registerTurnExecutor(async (turn) => {
+  console.error(`turn on session ${turn.sessionId}`);
+  await turn.run();
+});
+```
+
+The executor runs in this process against the live session, so the transcript, the events, and the streaming are the same as a turn Pi ran itself. `run()` is the whole turn: the prompt, the model calls, the tools, and the retries and compaction that follow them.
+
+An executor that returns without calling `run()` leaves the turn unrun, prompt included, which is how you hold a turn. Call `ctx.abort()` to stop one that is already running.
+
+One executor wins: the first extension to register one. Register none and Pi runs turns itself, which is the default.
+
+This is the hook for putting the loop under something else, such as a scheduler that serialises turns across sessions, or a durable executor that records each turn and re-runs one that a crash interrupted.
+
 ### pi.registerEntryRenderer(customType, renderer)
 
 Register a custom TUI renderer for custom entries with your `customType`. Custom entries are created with `pi.appendEntry()` and do not participate in LLM context.

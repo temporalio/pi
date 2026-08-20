@@ -1072,10 +1072,20 @@ export class AgentSession {
 
 	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
-		try {
+		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
+			}
+		};
+		try {
+			// An extension can take over when the turn runs. It is handed the same run(), so a
+			// turn that goes through an executor and one that does not are the same turn.
+			const executor = this._extensionRunner.getTurnExecutor();
+			if (!executor) {
+				await run();
+			} else {
+				await executor({ sessionId: this.sessionManager.getSessionId(), run });
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
