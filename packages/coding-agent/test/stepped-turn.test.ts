@@ -92,9 +92,12 @@ describe("stepped turn", () => {
 		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 	});
 
-	async function createSession(name: string): Promise<Harness> {
+	async function createSession(
+		name: string,
+		options: { responses?: AssistantMessage[]; reuse?: string } = {},
+	): Promise<Harness> {
 		const ran: string[] = [];
-		const responses = script();
+		const responses = options.responses ?? script();
 		let count = 0;
 		const tool: AgentTool<typeof toolSchema, { q: string }> = {
 			name: "dummy",
@@ -124,7 +127,10 @@ describe("stepped turn", () => {
 
 		const sessionDir = join(tempDir, name);
 		mkdirSync(sessionDir, { recursive: true });
-		const sessionManager = SessionManager.create(sessionDir, join(sessionDir, "sessions"));
+		// Reusing a file is what the worker path does: every activity opens the same session.
+		const sessionManager = options.reuse
+			? SessionManager.open(options.reuse)
+			: SessionManager.create(sessionDir, join(sessionDir, "sessions"));
 		const settingsManager = SettingsManager.create(sessionDir, sessionDir);
 		const authStorage = AuthStorage.create(join(sessionDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, sessionDir);
@@ -251,6 +257,28 @@ describe("stepped turn", () => {
 		expect(retry.asked()).toBe(0);
 		expect(replayed.replayed).toBe(true);
 		expect(replayed.toolCalls.map((c) => c.id)).toEqual(asked.toolCalls.map((c) => c.id));
+	});
+
+	it("keeps every failed attempt of a step in the transcript", async () => {
+		// The retry budget of a stepped turn is counted off the transcript, because the session
+		// that counts it is rebuilt per activity. Filtering these out, or never writing them,
+		// takes the budget back to zero on every attempt and asks a failing provider again until
+		// the step ceiling.
+		const failing = () => [{ ...assistant([{ type: "text", text: "" }]), stopReason: "error" as const }];
+
+		const first = await createSession("failed-once", { responses: failing() });
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+		const file = first.sessionManager.getSessionFile()!;
+
+		// The next attempt opens the same file, drops the error from memory, and fails again.
+		const second = await createSession("failed-twice", { responses: failing(), reuse: file });
+		second.session.agent.state.messages = persisted(first.sessionManager);
+		second.session.prepareStep();
+		await second.session.modelCall();
+
+		const errors = persisted(second.sessionManager).filter((m) => m.role === "assistant" && m.stopReason === "error");
+		expect(errors).toHaveLength(2);
 	});
 
 	it("refuses a second model call while the step is still open", async () => {

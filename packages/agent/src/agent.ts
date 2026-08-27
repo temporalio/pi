@@ -380,6 +380,8 @@ export class Agent {
 			);
 		}
 		const messages = this.normalizePromptInput(input, images);
+		// A new prompt is a new turn, so a stop asked for during the last one does not carry in.
+		this._interrupted = false;
 		await this.runPromptMessages(messages);
 	}
 
