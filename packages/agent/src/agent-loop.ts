@@ -264,6 +264,9 @@ export async function runAgentModelCall(
 		if (last.stopReason === "error" || last.stopReason === "aborted") {
 			throw new Error("Cannot step from message role: assistant");
 		}
+		// The seal that follows emits turn_end either way, so a replayed step has to open the turn
+		// too. An extension pairing the two would see the boundaries drift apart otherwise.
+		await emit({ type: "turn_start" });
 		const toolCalls = last.content.filter((c) => c.type === "toolCall");
 		return {
 			toolCalls,

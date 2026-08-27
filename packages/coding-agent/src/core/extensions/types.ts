@@ -1181,6 +1181,11 @@ export type MarkdownTransformer = (markdown: string, context: MarkdownTransformC
 export interface TurnSteps {
 	/** Put the turn's messages in the transcript without running them. */
 	record(): Promise<void>;
+	/**
+	 * True once the turn was interrupted. An abort reaches the unit of work that is running, and
+	 * a driver has more units after it, so it has to stop asking for them itself.
+	 */
+	interrupted(): boolean;
 	modelCall(): Promise<AgentModelCallOutcome>;
 	/** Undefined when the transcript already held a result for the call, so nothing ran. */
 	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;

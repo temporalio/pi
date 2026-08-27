@@ -328,6 +328,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	// An abort reaches the unit of work that is running, and a turn driven a step at a time has
+	// more units after it. Without this the next model call starts with a fresh signal and runs
+	// work the user stopped.
+	private _turnInterrupted = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -1080,6 +1084,7 @@ export class AgentSession {
 	 */
 	private async _drive(initial: () => Promise<void>, record: () => void): Promise<void> {
 		this._isAgentRunActive = true;
+		this._turnInterrupted = false;
 		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
@@ -1090,6 +1095,7 @@ export class AgentSession {
 		// entry points, which would refuse a run that is under way.
 		const steps: TurnSteps = {
 			record: async () => record(),
+			interrupted: () => this._turnInterrupted,
 			modelCall: () => this.agent.modelCall(),
 			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
 			sealStep: async (results) => {
@@ -1246,7 +1252,9 @@ export class AgentSession {
 	 */
 	async modelCall(): Promise<AgentModelCallOutcome> {
 		if (this._isAgentRunActive) {
-			return { toolCalls: [], sequential: false, ended: true, replayed: false };
+			// Not "the response ended the run". A caller told that seals a step it never opened,
+			// which closes the previous one a second time.
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
 		}
 
 		this._isAgentRunActive = true;
@@ -1279,6 +1287,10 @@ export class AgentSession {
 	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }> {
 		try {
 			const outcome = await this.agent.sealStep(toolCalls);
+			// The model call can have happened in another process, so the message the post-run pass
+			// answers for is not in this session's memory. Without it a provider error never retries
+			// and a full context never compacts, and the turn reports itself as answered.
+			this._lastAssistantMessage ??= this._findLastAssistantMessage();
 			const needsAnotherPass = await this._handlePostAgentRun();
 			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
@@ -1792,6 +1804,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this._turnInterrupted = true;
 		this.agent.abort();
 		await this.waitForIdle();
 	}
