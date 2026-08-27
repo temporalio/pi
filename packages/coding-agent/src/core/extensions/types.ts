@@ -1168,6 +1168,35 @@ export interface MarkdownTransformContext {
 
 export type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string;
 
+/** The turn an executor was handed. */
+export interface TurnExecutorContext {
+	/** The session the turn belongs to, so an executor can key durable state on it. */
+	readonly sessionId: string;
+	/**
+	 * Run the turn to its end, exactly as pi runs it when no executor is registered. An executor
+	 * that only wants to decide when a turn runs calls this and nothing else.
+	 */
+	run(): Promise<void>;
+}
+
+/**
+ * Runs a turn on pi's behalf. It must call `turn.run()` for the turn to happen; an executor that
+ * returns without calling it leaves the turn unrun.
+ */
+export type TurnExecutor = (turn: TurnExecutorContext) => Promise<void>;
+
+export interface TurnExecutorOptions {
+	/**
+	 * Hand the executor a turn that an earlier run left unfinished, when the session opens. Off by
+	 * default, because finishing a turn is a model call the user did not ask for in this session.
+	 */
+	resumeOnStart?: boolean;
+}
+
+export interface RegisteredTurnExecutor extends TurnExecutorOptions {
+	executor: TurnExecutor;
+}
+
 export interface EntryRenderOptions {
 	expanded: boolean;
 }
@@ -1313,6 +1342,16 @@ export interface ExtensionAPI {
 
 	/** Register a transformer for user and assistant Markdown before Pi renders it in the interactive transcript. */
 	registerMarkdownTransformer(transformer: MarkdownTransformer): void;
+
+	/**
+	 * Take over when a turn runs. The executor is handed the turn and decides when to run it,
+	 * which is the seam for putting the loop under a scheduler or a durable executor. It runs in
+	 * this process against the live session, so the transcript and the streaming stay pi's own.
+	 *
+	 * One executor wins: the first extension to register one. Registering none leaves pi running
+	 * turns itself, which is the default.
+	 */
+	registerTurnExecutor(executor: TurnExecutor, options?: TurnExecutorOptions): void;
 
 	/** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
 	registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
@@ -1725,6 +1764,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	markdownTransformer?: MarkdownTransformer;
+	turnExecutor?: RegisteredTurnExecutor;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;

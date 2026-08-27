@@ -163,6 +163,9 @@ export type {
 	ToolResultEventResult,
 	TreePreparation,
 	TurnEndEvent,
+	TurnExecutor,
+	TurnExecutorContext,
+	TurnExecutorOptions,
 	TurnStartEvent,
 	// Events - User Bash
 	UserBashEvent,
