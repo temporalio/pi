@@ -7,7 +7,17 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { type AgentStepOutcome, runAgentLoop, runAgentLoopContinue, runAgentStep } from "./agent-loop.ts";
+import {
+	type AgentModelCallOutcome,
+	type AgentStepOutcome,
+	runAgentLoop,
+	runAgentLoopContinue,
+	runAgentModelCall,
+	runAgentSeal,
+	runAgentStep,
+	runAgentToolCall,
+	type TurnToolCallOutcome,
+} from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -410,6 +420,62 @@ export class Agent {
 		return await this.runSingleStep();
 	}
 
+	/**
+	 * The model call of one step, without the tools it asks for. Each reported call can then
+	 * run as its own unit of work, which is where a retry policy, a timeout or an approval
+	 * goes. The caller runs them and then calls sealStep(), including when nothing was run.
+	 */
+	async modelCall(): Promise<AgentModelCallOutcome> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		// A failed run is handled inside the lifecycle, so the default stands and the caller
+		// dispatches nothing.
+		let outcome: AgentModelCallOutcome = {
+			toolCalls: [],
+			sequential: false,
+			ended: true,
+			replayed: false,
+		};
+		await this.runWithLifecycle(async (signal) => {
+			outcome = await runAgentModelCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+		return outcome;
+	}
+
+	/**
+	 * Run one call the current step recorded. Undefined means the transcript already held a
+	 * result for it, so nothing ran. One at a time: two calls of the same step run
+	 * concurrently only when they run against agents of their own.
+	 */
+	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+		return this.runStepUnit((signal) =>
+			runAgentToolCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCallId,
+				(event) => this.processEvents(event),
+				signal,
+			),
+		);
+	}
+
+	/** Close the current step with its results, in the order the model asked for the calls. */
+	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<AgentStepOutcome> {
+		return this.runStepUnit(() =>
+			runAgentSeal(this.createContextSnapshot(), this.createLoopConfig(), toolCalls, (event) =>
+				this.processEvents(event),
+			),
+		);
+	}
+
 	private normalizePromptInput(
 		input: string | AgentMessage | AgentMessage[],
 		images?: ImageContent[],
@@ -542,6 +608,34 @@ export class Agent {
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
+		} finally {
+			this.finishRun();
+		}
+	}
+
+	/**
+	 * The same run window as runWithLifecycle, except that a failure is the caller's. A tool
+	 * call and a seal both happen after the step's message is recorded, so turning a failure
+	 * into an assistant message would leave one sitting behind a message still being settled,
+	 * and the calls it hides would stop reading as unsettled.
+	 */
+	private async runStepUnit<T>(executor: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		const abortController = new AbortController();
+		let resolvePromise = () => {};
+		const promise = new Promise<void>((resolve) => {
+			resolvePromise = resolve;
+		});
+		this.activeRun = { promise, resolve: resolvePromise, abortController };
+
+		this._state.isStreaming = true;
+		this._state.streamingMessage = undefined;
+
+		try {
+			return await executor(abortController.signal);
 		} finally {
 			this.finishRun();
 		}
