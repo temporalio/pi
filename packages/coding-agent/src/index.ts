@@ -3,6 +3,7 @@
 // What AgentSession's stepped calls hand back. Re-exported so a caller driving a turn from
 // outside needs one package, the way every other type it touches does.
 export type { AgentModelCallOutcome, TurnToolCallOutcome } from "@earendil-works/pi-agent-core";
+export { UNKNOWN_TOOL_CALL_OUTCOME, unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 export { type Args, parseArgs } from "./cli/args.ts";
 // Config paths
 export {

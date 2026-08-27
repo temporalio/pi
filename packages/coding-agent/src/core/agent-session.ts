@@ -26,6 +26,7 @@ import type {
 	ThinkingLevel,
 	TurnToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
+import { unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -311,12 +312,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // Constants
 // ============================================================================
 
-// The tool can have run before the session stopped, so the model is told the outcome
-// is unknown. "Failed" would invite a second run of an effect that already happened.
-const INTERRUPTED_TOOL_CALL_RESULT =
-	"The outcome of this tool call is unknown. The session stopped after the call started " +
-	"but before the result was recorded. It can have taken effect. Check the current state " +
-	"before you try again.";
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -1131,15 +1126,7 @@ export class AgentSession {
 
 		const dangling = findDanglingToolCalls(messages);
 		if (dangling.length > 0) {
-			const settled: ToolResultMessage[] = dangling.map((toolCall) => ({
-				role: "toolResult",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				content: [{ type: "text", text: INTERRUPTED_TOOL_CALL_RESULT }],
-				details: {},
-				isError: true,
-				timestamp: Date.now(),
-			}));
+			const settled: ToolResultMessage[] = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
 			this._recordMessages(settled);
 			return true;
 		}

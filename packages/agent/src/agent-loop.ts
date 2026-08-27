@@ -355,6 +355,32 @@ export async function runAgentSeal(
 	return { messages: newMessages, hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls };
 }
 
+/**
+ * What the transcript says about a call when nothing can say whether it ran. The tool can have
+ * had its effect before the run stopped, so calling it a failure would invite a second run of
+ * something that already happened.
+ */
+export const UNKNOWN_TOOL_CALL_OUTCOME =
+	"The outcome of this tool call is unknown. The session stopped after the call started " +
+	"but before the result was recorded. It can have taken effect. Check the current state " +
+	"before you try again.";
+
+/** Settle a call nothing can answer for, so the step it belongs to still closes. */
+export function unknownToolCallOutcome(toolCall: { id: string; name: string }): TurnToolCallOutcome {
+	return {
+		message: {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: UNKNOWN_TOOL_CALL_OUTCOME }],
+			details: {},
+			isError: true,
+			timestamp: Date.now(),
+		},
+		terminate: false,
+	};
+}
+
 function lastAssistantMessage(messages: ReadonlyArray<AgentMessage>): AssistantMessage | undefined {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
