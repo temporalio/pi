@@ -149,6 +149,7 @@ export type {
 	TurnExecutorContext,
 	TurnExecutorOptions,
 	TurnStartEvent,
+	TurnSteps,
 	UserBashEvent,
 	UserBashEventResult,
 	WidgetPlacement,

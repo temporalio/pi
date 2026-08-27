@@ -10,10 +10,12 @@
 
 import type {
 	AgentMessage,
+	AgentModelCallOutcome,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
 	ToolExecutionMode,
+	TurnToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
 import type {
 	Api,
@@ -1168,6 +1170,23 @@ export interface MarkdownTransformContext {
 
 export type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string;
 
+/**
+ * The turn an executor was handed, one step at a time. Each step is a model call, the calls it
+ * asks for, and a seal that records their results and says whether the turn is over.
+ *
+ * A call's result is reported rather than entered in the transcript, because a step's results go
+ * in together, in the order the model asked for the calls. That leaves an executor free to run
+ * them wherever it likes and settle them in whatever order they finish.
+ */
+export interface TurnSteps {
+	/** Put the turn's messages in the transcript without running them. */
+	record(): Promise<void>;
+	modelCall(): Promise<AgentModelCallOutcome>;
+	/** Undefined when the transcript already held a result for the call, so nothing ran. */
+	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
+	sealStep(results: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }>;
+}
+
 /** The turn an executor was handed. */
 export interface TurnExecutorContext {
 	/** The session the turn belongs to, so an executor can key durable state on it. */
@@ -1177,6 +1196,11 @@ export interface TurnExecutorContext {
 	 * that only wants to decide when a turn runs calls this and nothing else.
 	 */
 	run(): Promise<void>;
+	/**
+	 * The same turn, driven a step at a time, for an executor that wants a unit of work smaller
+	 * than a turn. One or the other: a turn that is both run and stepped runs twice.
+	 */
+	readonly steps: TurnSteps;
 }
 
 /**

@@ -97,6 +97,7 @@ import {
 	type TreePreparation,
 	type TurnEndEvent,
 	type TurnStartEvent,
+	type TurnSteps,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
@@ -1064,16 +1065,39 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		await this._drive(() => this.agent.prompt(messages));
+		await this._drive(
+			() => this.agent.prompt(messages),
+			() => {
+				this._recordMessages(Array.isArray(messages) ? messages : [messages]);
+			},
+		);
 	}
 
-	private async _drive(initial: () => Promise<void>): Promise<void> {
+	/**
+	 * Run a turn, through an executor if one registered. `record` is what the turn would add to
+	 * the transcript before anything runs, so an executor driving the turn one step at a time can
+	 * put it there without a model call.
+	 */
+	private async _drive(initial: () => Promise<void>, record: () => void): Promise<void> {
 		this._isAgentRunActive = true;
 		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		};
+		// Already inside a run, so these go to the agent rather than through the session's own
+		// entry points, which would refuse a run that is under way.
+		const steps: TurnSteps = {
+			record: async () => record(),
+			modelCall: () => this.agent.modelCall(),
+			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
+			sealStep: async (results) => {
+				const outcome = await this.agent.sealStep(results);
+				// Retries and compaction live here, so a stepped turn keeps both.
+				const needsAnotherPass = await this._handlePostAgentRun();
+				return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
+			},
 		};
 		try {
 			// An extension can take over when the turn runs. It is handed the same run(), so a
@@ -1082,7 +1106,7 @@ export class AgentSession {
 			if (!registered) {
 				await run();
 			} else {
-				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run });
+				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run, steps });
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -1102,7 +1126,11 @@ export class AgentSession {
 			return false;
 		}
 
-		await this._drive(() => this.agent.continue());
+		// prepareStep settled what the stop left behind, so the transcript needs nothing added.
+		await this._drive(
+			() => this.agent.continue(),
+			() => {},
+		);
 		return true;
 	}
 
