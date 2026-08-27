@@ -703,6 +703,10 @@ export class AgentSession {
 	 * How many attempts of the current step already failed. Each one leaves an error message that
 	 * the next attempt drops from memory and keeps in the transcript, so the transcript is what
 	 * carries the count across a process that does not.
+	 *
+	 * That the transcript keeps them is a contract, not an accident. Dropping error entries from
+	 * the session file, or filtering them out of the context, takes the retry budget back to zero
+	 * on every attempt, and a failing provider is then asked again until the step ceiling.
 	 */
 	private _countTrailingFailures(): number {
 		const messages = this.agent.state.messages;
@@ -1099,7 +1103,8 @@ export class AgentSession {
 	private async _drive(initial: () => Promise<void>, record: () => void): Promise<void> {
 		this._isAgentRunActive = true;
 		// The turn starts here, so a stop asked for during the last one does not carry into it.
-		this.agent.clearInterrupt();
+		// Optional: a session can be handed an Agent from an older build of the core package.
+		this.agent.clearInterrupt?.();
 		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
@@ -1116,7 +1121,7 @@ export class AgentSession {
 			sealStep: async (results) => {
 				const outcome = await this.agent.sealStep(results);
 				// Retries and compaction live here, so a stepped turn keeps both.
-				const needsAnotherPass = await this._handlePostAgentRun();
+				const needsAnotherPass = await this._postSealPass();
 				return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 			},
 		};
@@ -1302,21 +1307,31 @@ export class AgentSession {
 	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }> {
 		try {
 			const outcome = await this.agent.sealStep(toolCalls);
-			if (!this._lastAssistantMessage) {
-				// The model call happened in another process, so this session holds none of what the
-				// post-run pass reads. Without the message a provider error never retries and a full
-				// context never compacts; without the count the cap is never reached and the backoff
-				// never grows, so a failing provider is asked again until the step ceiling.
-				this._lastAssistantMessage = this._findLastAssistantMessage();
-				this._retryAttempt = Math.max(0, this._countTrailingFailures() - 1);
-			}
-			const needsAnotherPass = await this._handlePostAgentRun();
+			const needsAnotherPass = await this._postSealPass();
 			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
 		}
+	}
+
+	/**
+	 * The post-run pass for a step whose model call this session did not make, or made in an
+	 * attempt whose answer was lost. `_handlePostAgentRun` reads a field the run's own events set
+	 * and consumes, so on either path it finds nothing and reports a turn that is over: a provider
+	 * error never retries and a full context never compacts.
+	 */
+	private async _postSealPass(): Promise<boolean> {
+		if (!this._lastAssistantMessage) {
+			this._lastAssistantMessage = this._findLastAssistantMessage();
+			// Only when this session has not counted any itself. A seal that already retried holds
+			// the real number, and the transcript's would take the budget back to the start.
+			if (this._retryAttempt === 0) {
+				this._retryAttempt = Math.max(0, this._countTrailingFailures() - 1);
+			}
+		}
+		return this._handlePostAgentRun();
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
