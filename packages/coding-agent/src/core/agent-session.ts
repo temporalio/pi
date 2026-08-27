@@ -19,10 +19,12 @@ import type {
 	Agent,
 	AgentEvent,
 	AgentMessage,
+	AgentModelCallOutcome,
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
 	ThinkingLevel,
+	TurnToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
@@ -1209,6 +1211,59 @@ export class AgentSession {
 		try {
 			const outcome = await this.agent.step();
 			// Retries and compaction live here, so a stepped run keeps both.
+			const needsAnotherPass = await this._handlePostAgentRun();
+			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
+	/**
+	 * The model call of one step, without running the tools it asks for. Each reported call is
+	 * recorded in the transcript and left for the caller to run, which is what lets a call have
+	 * a retry policy, a timeout or an approval of its own.
+	 *
+	 * The run stays open until sealStep() closes it, so the three calls are one step and not
+	 * three. `replayed` says the transcript already held the response and no model call was
+	 * made, which is the answer a caller that lost its record of the call gets back.
+	 */
+	async modelCall(): Promise<AgentModelCallOutcome> {
+		if (this._isAgentRunActive) {
+			return { toolCalls: [], sequential: false, ended: true, replayed: false };
+		}
+
+		this._isAgentRunActive = true;
+		try {
+			return await this.agent.modelCall();
+		} catch (error) {
+			// The step never opened, so nothing is left to seal and the run must not stay marked
+			// as active.
+			await this._emitAgentSettled();
+			throw error;
+		}
+	}
+
+	/**
+	 * Run one call the current step recorded, and report its result rather than entering it in
+	 * the transcript. The results of a step go in together, in the order the model asked for
+	 * the calls, so a caller running them out of order still leaves the transcript pi's own.
+	 *
+	 * Undefined means the transcript already held a result for the call, so nothing ran.
+	 */
+	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+		return this.agent.runToolCall(toolCallId);
+	}
+
+	/**
+	 * Close the step: record its results, decide whether the turn keeps going, and settle the
+	 * run. Every step ends here, including one whose model call ran no tools and one whose
+	 * model call failed, because the retry and the compaction that answer for those live here.
+	 */
+	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }> {
+		try {
+			const outcome = await this.agent.sealStep(toolCalls);
 			const needsAnotherPass = await this._handlePostAgentRun();
 			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
