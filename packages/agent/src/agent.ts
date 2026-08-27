@@ -212,6 +212,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private _interrupted = false;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -327,7 +328,22 @@ export class Agent {
 
 	/** Abort the current run, if one is active. */
 	abort(): void {
+		this._interrupted = true;
 		this.activeRun?.abortController.abort();
+	}
+
+	/**
+	 * Whether a stop was asked for since the turn started. An abort reaches the unit of work that
+	 * is running, and a turn driven a step at a time has more units after it, each with a signal of
+	 * its own. A driver that does not ask this runs work the user stopped.
+	 */
+	get interrupted(): boolean {
+		return this._interrupted;
+	}
+
+	/** Start a fresh turn. Callers that drive the steps themselves own the turn boundary. */
+	clearInterrupt(): void {
+		this._interrupted = false;
 	}
 
 	/**

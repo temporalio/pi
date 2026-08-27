@@ -328,10 +328,6 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
-	// An abort reaches the unit of work that is running, and a turn driven a step at a time has
-	// more units after it. Without this the next model call starts with a fresh signal and runs
-	// work the user stopped.
-	private _turnInterrupted = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -701,6 +697,24 @@ export class AgentSession {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * How many attempts of the current step already failed. Each one leaves an error message that
+	 * the next attempt drops from memory and keeps in the transcript, so the transcript is what
+	 * carries the count across a process that does not.
+	 */
+	private _countTrailingFailures(): number {
+		const messages = this.agent.state.messages;
+		let failures = 0;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message.role !== "assistant" || message.stopReason !== "error") {
+				break;
+			}
+			failures++;
+		}
+		return failures;
 	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
@@ -1084,7 +1098,8 @@ export class AgentSession {
 	 */
 	private async _drive(initial: () => Promise<void>, record: () => void): Promise<void> {
 		this._isAgentRunActive = true;
-		this._turnInterrupted = false;
+		// The turn starts here, so a stop asked for during the last one does not carry into it.
+		this.agent.clearInterrupt();
 		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
@@ -1095,7 +1110,7 @@ export class AgentSession {
 		// entry points, which would refuse a run that is under way.
 		const steps: TurnSteps = {
 			record: async () => record(),
-			interrupted: () => this._turnInterrupted,
+			interrupted: () => this.agent.interrupted,
 			modelCall: () => this.agent.modelCall(),
 			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
 			sealStep: async (results) => {
@@ -1287,10 +1302,14 @@ export class AgentSession {
 	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }> {
 		try {
 			const outcome = await this.agent.sealStep(toolCalls);
-			// The model call can have happened in another process, so the message the post-run pass
-			// answers for is not in this session's memory. Without it a provider error never retries
-			// and a full context never compacts, and the turn reports itself as answered.
-			this._lastAssistantMessage ??= this._findLastAssistantMessage();
+			if (!this._lastAssistantMessage) {
+				// The model call happened in another process, so this session holds none of what the
+				// post-run pass reads. Without the message a provider error never retries and a full
+				// context never compacts; without the count the cap is never reached and the backoff
+				// never grows, so a failing provider is asked again until the step ceiling.
+				this._lastAssistantMessage = this._findLastAssistantMessage();
+				this._retryAttempt = Math.max(0, this._countTrailingFailures() - 1);
+			}
 			const needsAnotherPass = await this._handlePostAgentRun();
 			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
 		} finally {
@@ -1804,7 +1823,6 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
-		this._turnInterrupted = true;
 		this.agent.abort();
 		await this.waitForIdle();
 	}
