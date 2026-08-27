@@ -39,6 +39,7 @@ const usage = {
 /** For a test about which executor wins, where the turn itself is beside the point. */
 const noSteps: TurnSteps = {
 	record: async () => {},
+	interrupted: () => false,
 	modelCall: async () => ({ toolCalls: [], sequential: false, ended: true, replayed: false }),
 	runToolCall: async () => undefined,
 	sealStep: async () => ({ done: true }),

@@ -174,7 +174,7 @@ describe("model call", () => {
 			[createUserMessage("go"), createAssistantMessage([toolCall("t1")], "toolUse")],
 			[tool],
 		);
-		const { emit } = collector();
+		const { emit, events } = collector();
 
 		const outcome = await runAgentModelCall(context, config(), emit, undefined, streamFn);
 
@@ -183,6 +183,8 @@ describe("model call", () => {
 		expect(asked.count).toBe(0);
 		expect(outcome.replayed).toBe(true);
 		expect(outcome.toolCalls.map((c) => c.id)).toEqual(["t1"]);
+		// The seal that follows emits turn_end either way, so the turn has to be opened here too.
+		expect(events.filter((e) => e.type === "turn_start")).toHaveLength(1);
 	});
 
 	it("says when the calls have to run one at a time", async () => {

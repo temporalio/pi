@@ -253,6 +253,47 @@ describe("stepped turn", () => {
 		expect(replayed.toolCalls.map((c) => c.id)).toEqual(asked.toolCalls.map((c) => c.id));
 	});
 
+	it("refuses a second model call while the step is still open", async () => {
+		const harness = await createSession("busy");
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+
+		// Answering "the response ended the run" would have the caller seal a step it never
+		// opened, which closes the previous one a second time.
+		await expect(harness.session.modelCall()).rejects.toThrow(/already processing/);
+	});
+
+	it("seals against the message the model call left, not the one it made itself", async () => {
+		const asking = await createSession("post-run-model");
+		await asking.session.recordPrompt("go");
+		const first = await asking.session.modelCall();
+		const results: TurnToolCallOutcome[] = [];
+		for (const call of first.toolCalls) {
+			const result = await asking.session.runToolCall(call.id);
+			if (result) results.push(result);
+		}
+		await asking.session.sealStep(results);
+		// The last step asks for no tools, so nothing but the post-run pass can keep the turn going.
+		await asking.session.modelCall();
+
+		// The seal is its own activity, so on the worker path it opens a session that never saw
+		// the model call happen. That is the whole point of the split, and it is what makes the
+		// post-run pass read the transcript instead of its own memory.
+		const sealing = await createSession("post-run-seal");
+		sealing.session.agent.state.messages = persisted(asking.sessionManager);
+		// A queued message is the cheapest thing the pass answers for. A provider error that wants
+		// a retry, and a full context that wants a compaction, reach the same code the same way.
+		sealing.session.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "and then?" }],
+			timestamp: Date.now(),
+		});
+
+		const { done } = await sealing.session.sealStep([]);
+
+		expect(done).toBe(false);
+	});
+
 	it("does not run a call twice when the step is driven again", async () => {
 		const harness = await createSession("twice");
 		await harness.session.recordPrompt("go");

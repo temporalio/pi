@@ -245,6 +245,7 @@ export {
 	type CustomEntry,
 	type CustomMessageEntry,
 	type FileEntry,
+	findDanglingToolCalls,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,
