@@ -399,12 +399,15 @@ export class Agent {
 		if (lastMessage.role === "assistant") {
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
+				// A queued message starts a turn of its own, same as prompt().
+				this._interrupted = false;
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
+				this._interrupted = false;
 				await this.runPromptMessages(queuedFollowUps);
 				return;
 			}

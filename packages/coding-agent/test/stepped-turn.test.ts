@@ -277,8 +277,36 @@ describe("stepped turn", () => {
 		second.session.prepareStep();
 		await second.session.modelCall();
 
-		const errors = persisted(second.sessionManager).filter((m) => m.role === "assistant" && m.stopReason === "error");
-		expect(errors).toHaveLength(2);
+		// Trailing and consecutive, not just present: that is what the count reads.
+		const tail = persisted(second.sessionManager).slice(-2);
+		expect(tail.map((m) => m.role === "assistant" && m.stopReason)).toEqual(["error", "error"]);
+	});
+
+	it("stops retrying a step once the transcript shows the budget is spent", async () => {
+		// The count itself, not just its input. A seal that reads it as zero every time asks a
+		// failing provider again on every step until the ceiling, which is what happens when the
+		// session holding the counter is rebuilt per activity.
+		// The wording matters: only a provider error the retry policy recognises reaches the count.
+		const failed = () => ({
+			...assistant([{ type: "text", text: "" }]),
+			stopReason: "error" as const,
+			errorMessage: "overloaded",
+		});
+		const harness = await createSession("budget-spent");
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "go" }], timestamp: Date.now() },
+			failed(),
+			failed(),
+			failed(),
+			failed(),
+		];
+
+		const started = Date.now();
+		const { done } = await harness.session.sealStep([]);
+
+		// Four failures against the default cap of three. Retrying would also have slept first.
+		expect(done).toBe(true);
+		expect(Date.now() - started).toBeLessThan(1000);
 	});
 
 	it("refuses a second model call while the step is still open", async () => {

@@ -328,6 +328,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	// A retry the post-run pass already decided on. `_prepareRetry` takes the errored message out
+	// of memory, so a seal that runs again cannot re-derive the decision from the transcript it can
+	// see, and would call a turn answered that is waiting on another attempt.
+	private _pendingRetry = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -664,6 +668,7 @@ export class AgentSession {
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				this._pendingRetry = false;
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
@@ -1323,6 +1328,10 @@ export class AgentSession {
 	 * error never retries and a full context never compacts.
 	 */
 	private async _postSealPass(): Promise<boolean> {
+		// Before anything derived from a message, because this is the case where the message is gone.
+		if (this._pendingRetry) {
+			return true;
+		}
 		if (!this._lastAssistantMessage) {
 			this._lastAssistantMessage = this._findLastAssistantMessage();
 			// Only when this session has not counted any itself. A seal that already retried holds
@@ -1342,6 +1351,7 @@ export class AgentSession {
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+			this._pendingRetry = true;
 			return true;
 		}
 
