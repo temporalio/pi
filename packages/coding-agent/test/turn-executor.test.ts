@@ -42,7 +42,8 @@ const noSteps: TurnSteps = {
 	interrupted: () => false,
 	modelCall: async () => ({ toolCalls: [], sequential: false, ended: true, replayed: false }),
 	runToolCall: async () => undefined,
-	sealStep: async () => ({ done: true }),
+	sealStep: async () => ({ done: true, retryAttempt: 0 }),
+	abandonStep: async () => {},
 };
 
 function assistant(text: string): AssistantMessage {
