@@ -1191,7 +1191,7 @@ export interface TurnSteps {
 	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
 	sealStep(
 		results: ReadonlyArray<TurnToolCallOutcome>,
-		options?: { expectCalls?: ReadonlyArray<string>; retryAttempt?: number },
+		options?: { expectCalls?: ReadonlyArray<string>; retryAttempt?: number; postRun?: boolean },
 	): Promise<{ done: boolean; retryAttempt: number }>;
 	/** Give up on a step without closing it, so the session is not left mid-step. */
 	abandonStep(): Promise<void>;

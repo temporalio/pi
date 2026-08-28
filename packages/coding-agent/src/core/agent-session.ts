@@ -1126,7 +1126,8 @@ export class AgentSession {
 			sealStep: async (results, options) => {
 				const outcome = await this.agent.sealStep(results, options?.expectCalls);
 				// Retries and compaction live here, so a stepped turn keeps both.
-				const needsAnotherPass = await this._postSealPass(options?.retryAttempt);
+				const needsAnotherPass =
+					options?.postRun === false ? false : await this._postSealPass(options?.retryAttempt);
 				return {
 					done: !outcome.hasMoreToolCalls && !needsAnotherPass,
 					retryAttempt: this._retryAttempt,
@@ -1316,11 +1317,17 @@ export class AgentSession {
 	 */
 	async sealStep(
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
-		options: { expectCalls?: ReadonlyArray<string>; retryAttempt?: number } = {},
+		options: {
+			expectCalls?: ReadonlyArray<string>;
+			retryAttempt?: number;
+			/** Record the results and stop. What answers for a step that went wrong is a provider
+			 * retry or a compaction, and neither is work to do on a turn the user just stopped. */
+			postRun?: boolean;
+		} = {},
 	): Promise<{ done: boolean; retryAttempt: number }> {
 		try {
 			const outcome = await this.agent.sealStep(toolCalls, options.expectCalls);
-			const needsAnotherPass = await this._postSealPass(options.retryAttempt);
+			const needsAnotherPass = options.postRun === false ? false : await this._postSealPass(options.retryAttempt);
 			// Handed back so a caller that outlives this session can carry it to the next seal. The
 			// transcript can say the same thing, but a compaction rewrites the transcript.
 			return {
@@ -1364,6 +1371,8 @@ export class AgentSession {
 	 * resumed or stepped again: `waitForIdle` never settles and `prepareStep` refuses.
 	 */
 	async abandonStep(): Promise<void> {
+		this._pendingRetry = false;
+		this._retryAttempt = 0;
 		this._systemPromptOverride = undefined;
 		this._flushPendingBashMessages();
 		await this._emitAgentSettled();
@@ -1381,13 +1390,19 @@ export class AgentSession {
 			return true;
 		}
 
-		if (msg.stopReason === "error" && this._retryAttempt > 0) {
-			this._emit({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this._retryAttempt,
-				finalError: msg.errorMessage,
-			});
+		if (msg.stopReason === "error") {
+			if (this._retryAttempt > 0) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: msg.errorMessage,
+				});
+				this._retryAttempt = 0;
+			}
+		} else {
+			// A step that got an answer spends none of the budget. A live session resets on the
+			// message event; a session rebuilt per activity never sees one, so it resets here.
 			this._retryAttempt = 0;
 		}
 

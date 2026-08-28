@@ -309,6 +309,21 @@ describe("stepped turn", () => {
 		expect(Date.now() - started).toBeLessThan(1000);
 	});
 
+	it("gives a step that got an answer a fresh retry budget", async () => {
+		// The count is carried across activities by the caller, and a session rebuilt per activity
+		// never sees the message event that resets it in a live one. Without the reset here, three
+		// failures anywhere in a turn end the next step that fails, however well it went between.
+		const harness = await createSession("budget-reset");
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "go" }], timestamp: Date.now() },
+			assistant([{ type: "text", text: "an answer" }]),
+		];
+
+		const { retryAttempt } = await harness.session.sealStep([], { retryAttempt: 3 });
+
+		expect(retryAttempt).toBe(0);
+	});
+
 	it("refuses a second model call while the step is still open", async () => {
 		const harness = await createSession("busy");
 		await harness.session.recordPrompt("go");
