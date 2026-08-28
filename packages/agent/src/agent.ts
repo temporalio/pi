@@ -488,11 +488,22 @@ export class Agent {
 		);
 	}
 
-	/** Close the current step with its results, in the order the model asked for the calls. */
-	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<AgentStepOutcome> {
+	/**
+	 * Close the current step with its results, in the order the model asked for the calls.
+	 * `expectCalls` names the step being closed, so a seal cannot attribute them to a message
+	 * something else appended in between.
+	 */
+	async sealStep(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		expectCalls?: ReadonlyArray<string>,
+	): Promise<AgentStepOutcome> {
 		return this.runStepUnit(() =>
-			runAgentSeal(this.createContextSnapshot(), this.createLoopConfig(), toolCalls, (event) =>
-				this.processEvents(event),
+			runAgentSeal(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCalls,
+				(event) => this.processEvents(event),
+				expectCalls,
 			),
 		);
 	}

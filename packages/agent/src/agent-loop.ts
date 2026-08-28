@@ -324,17 +324,31 @@ export async function runAgentToolCall(
 /**
  * Close the current step with the results of its calls, in the order the model asked for them.
  * The step's message is the last assistant message, so a seal that runs twice finds the same
- * one and records only what is missing.
+ * one and records only what is missing. Pass `expectCalls` to say which step that has to be:
+ * anything appended between the model call and the seal moves the message the results would
+ * otherwise be attributed to, and on a durable driver those are separate units of work.
  */
 export async function runAgentSeal(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 	emit: AgentEventSink,
+	expectCalls?: ReadonlyArray<string>,
 ): Promise<AgentStepOutcome> {
 	const message = lastAssistantMessage(context.messages);
 	if (!message) {
 		throw new Error("No assistant message to seal");
+	}
+
+	const recorded = message.content.filter((block) => block.type === "toolCall").map((call) => call.id);
+	if (expectCalls && !sameCalls(recorded, expectCalls)) {
+		throw new Error(
+			`Cannot seal: the last assistant message asked for [${recorded.join(", ")}], not [${expectCalls.join(", ")}]`,
+		);
+	}
+	const stray = toolCalls.find((call) => !recorded.includes(call.message.toolCallId));
+	if (stray) {
+		throw new Error(`Cannot seal: no call ${stray.message.toolCallId} in the message being closed`);
 	}
 
 	// A response that ended the run closed the turn as it went, so there is nothing left to
@@ -382,6 +396,10 @@ export function unknownToolCallOutcome(toolCall: { id: string; name: string }): 
 		},
 		terminate: false,
 	};
+}
+
+function sameCalls(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
+	return a.length === b.length && a.every((id) => b.includes(id));
 }
 
 function lastAssistantMessage(messages: ReadonlyArray<AgentMessage>): AssistantMessage | undefined {

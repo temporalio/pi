@@ -1123,12 +1123,17 @@ export class AgentSession {
 			interrupted: () => this.agent.interrupted,
 			modelCall: () => this.agent.modelCall(),
 			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
-			sealStep: async (results) => {
-				const outcome = await this.agent.sealStep(results);
+			sealStep: async (results, options) => {
+				const outcome = await this.agent.sealStep(results, options?.expectCalls);
 				// Retries and compaction live here, so a stepped turn keeps both.
-				const needsAnotherPass = await this._postSealPass();
-				return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
+				const needsAnotherPass = await this._postSealPass(options?.retryAttempt);
+				return {
+					done: !outcome.hasMoreToolCalls && !needsAnotherPass,
+					retryAttempt: this._retryAttempt,
+				};
 			},
+			// The turn's own run window is `_drive`'s, so there is nothing here to give up on.
+			abandonStep: async () => {},
 		};
 		try {
 			// An extension can take over when the turn runs. It is handed the same run(), so a
@@ -1309,11 +1314,19 @@ export class AgentSession {
 	 * run. Every step ends here, including one whose model call ran no tools and one whose
 	 * model call failed, because the retry and the compaction that answer for those live here.
 	 */
-	async sealStep(toolCalls: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }> {
+	async sealStep(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		options: { expectCalls?: ReadonlyArray<string>; retryAttempt?: number } = {},
+	): Promise<{ done: boolean; retryAttempt: number }> {
 		try {
-			const outcome = await this.agent.sealStep(toolCalls);
-			const needsAnotherPass = await this._postSealPass();
-			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
+			const outcome = await this.agent.sealStep(toolCalls, options.expectCalls);
+			const needsAnotherPass = await this._postSealPass(options.retryAttempt);
+			// Handed back so a caller that outlives this session can carry it to the next seal. The
+			// transcript can say the same thing, but a compaction rewrites the transcript.
+			return {
+				done: !outcome.hasMoreToolCalls && !needsAnotherPass,
+				retryAttempt: this._retryAttempt,
+			};
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
@@ -1327,7 +1340,7 @@ export class AgentSession {
 	 * and consumes, so on either path it finds nothing and reports a turn that is over: a provider
 	 * error never retries and a full context never compacts.
 	 */
-	private async _postSealPass(): Promise<boolean> {
+	private async _postSealPass(retryAttempt?: number): Promise<boolean> {
 		// Before anything derived from a message, because this is the case where the message is gone.
 		if (this._pendingRetry) {
 			return true;
@@ -1335,12 +1348,25 @@ export class AgentSession {
 		if (!this._lastAssistantMessage) {
 			this._lastAssistantMessage = this._findLastAssistantMessage();
 			// Only when this session has not counted any itself. A seal that already retried holds
-			// the real number, and the transcript's would take the budget back to the start.
+			// the real number, and a count taken from anywhere else would take the budget back to
+			// the start. A caller that keeps the count somewhere durable is believed over the
+			// transcript, which a compaction can rewrite.
 			if (this._retryAttempt === 0) {
-				this._retryAttempt = Math.max(0, this._countTrailingFailures() - 1);
+				this._retryAttempt = retryAttempt ?? Math.max(0, this._countTrailingFailures() - 1);
 			}
 		}
 		return this._handlePostAgentRun();
+	}
+
+	/**
+	 * Give up on a step without closing it. A driver that stops between the model call and the
+	 * seal leaves the run marked active, and a session in that state cannot be interrupted,
+	 * resumed or stepped again: `waitForIdle` never settles and `prepareStep` refuses.
+	 */
+	async abandonStep(): Promise<void> {
+		this._systemPromptOverride = undefined;
+		this._flushPendingBashMessages();
+		await this._emitAgentSettled();
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {

@@ -1189,7 +1189,12 @@ export interface TurnSteps {
 	modelCall(): Promise<AgentModelCallOutcome>;
 	/** Undefined when the transcript already held a result for the call, so nothing ran. */
 	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
-	sealStep(results: ReadonlyArray<TurnToolCallOutcome>): Promise<{ done: boolean }>;
+	sealStep(
+		results: ReadonlyArray<TurnToolCallOutcome>,
+		options?: { expectCalls?: ReadonlyArray<string>; retryAttempt?: number },
+	): Promise<{ done: boolean; retryAttempt: number }>;
+	/** Give up on a step without closing it, so the session is not left mid-step. */
+	abandonStep(): Promise<void>;
 }
 
 /** The turn an executor was handed. */
