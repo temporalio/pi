@@ -1624,6 +1624,28 @@ A crash during a tool call leaves the session with a tool call and no result, an
 
 This is the hook for putting the loop under something else, such as a scheduler that serialises turns across sessions, or a durable executor that records each turn and re-runs one that a crash interrupted.
 
+For a unit of work smaller than a turn, `turn.steps` drives the same turn a step at a time. A step is a model call, the calls it asks for, and a seal that records their results and says whether the turn is over:
+
+```typescript
+pi.registerTurnExecutor(async (turn) => {
+  await turn.steps.record();
+  for (;;) {
+    const model = await turn.steps.modelCall();
+    const results = [];
+    for (const call of model.ended ? [] : model.toolCalls) {
+      const result = await turn.steps.runToolCall(call.id);
+      if (result) results.push(result);
+    }
+    const { done } = await turn.steps.sealStep(results);
+    if (done) return;
+  }
+});
+```
+
+`record()` puts the turn's messages in the transcript without running them. `modelCall()` reports the calls the model asked for, recorded and not run, so each one can have a retry policy, a timeout or an approval of its own. `runToolCall()` reports a call's result instead of entering it, because a step's results go in together, in the order the model asked for them; `model.sequential` says when they cannot overlap. `sealStep()` records them and answers whether the turn keeps going.
+
+One or the other: a turn that is both run and stepped runs twice. `runToolCall()` returns undefined for a call the transcript already answered, and a `modelCall()` whose response is already recorded reports `replayed` and asks the model nothing, so an executor that lost its own record of a step does not pay for it twice.
+
 ### pi.registerEntryRenderer(customType, renderer)
 
 Register a custom TUI renderer for custom entries with your `customType`. Custom entries are created with `pi.appendEntry()` and do not participate in LLM context.

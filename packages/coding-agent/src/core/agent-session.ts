@@ -19,11 +19,14 @@ import type {
 	Agent,
 	AgentEvent,
 	AgentMessage,
+	AgentModelCallOutcome,
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
 	ThinkingLevel,
+	TurnToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
+import { unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -94,6 +97,7 @@ import {
 	type TreePreparation,
 	type TurnEndEvent,
 	type TurnStartEvent,
+	type TurnSteps,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
@@ -309,12 +313,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // Constants
 // ============================================================================
 
-// The tool can have run before the session stopped, so the model is told the outcome
-// is unknown. "Failed" would invite a second run of an effect that already happened.
-const INTERRUPTED_TOOL_CALL_RESULT =
-	"The outcome of this tool call is unknown. The session stopped after the call started " +
-	"but before the result was recorded. It can have taken effect. Check the current state " +
-	"before you try again.";
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -330,6 +328,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	// A retry the post-run pass already decided on. `_prepareRetry` takes the errored message out
+	// of memory, so a seal that runs again cannot re-derive the decision from the transcript it can
+	// see, and would call a turn answered that is waiting on another attempt.
+	private _pendingRetry = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -666,6 +668,7 @@ export class AgentSession {
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				this._pendingRetry = false;
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
@@ -699,6 +702,28 @@ export class AgentSession {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * How many attempts of the current step already failed. Each one leaves an error message that
+	 * the next attempt drops from memory and keeps in the transcript, so the transcript is what
+	 * carries the count across a process that does not.
+	 *
+	 * That the transcript keeps them is a contract, not an accident. Dropping error entries from
+	 * the session file, or filtering them out of the context, takes the retry budget back to zero
+	 * on every attempt, and a failing provider is then asked again until the step ceiling.
+	 */
+	private _countTrailingFailures(): number {
+		const messages = this.agent.state.messages;
+		let failures = 0;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message.role !== "assistant" || message.stopReason !== "error") {
+				break;
+			}
+			failures++;
+		}
+		return failures;
 	}
 
 	/** Find the last assistant message in agent state (including aborted ones) */
@@ -1067,16 +1092,49 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		await this._drive(() => this.agent.prompt(messages));
+		await this._drive(
+			() => this.agent.prompt(messages),
+			() => {
+				this._recordMessages(Array.isArray(messages) ? messages : [messages]);
+			},
+		);
 	}
 
-	private async _drive(initial: () => Promise<void>): Promise<void> {
+	/**
+	 * Run a turn, through an executor if one registered. `record` is what the turn would add to
+	 * the transcript before anything runs, so an executor driving the turn one step at a time can
+	 * put it there without a model call.
+	 */
+	private async _drive(initial: () => Promise<void>, record: () => void): Promise<void> {
 		this._isAgentRunActive = true;
+		// The turn starts here, so a stop asked for during the last one does not carry into it.
+		// Optional: a session can be handed an Agent from an older build of the core package.
+		this.agent.clearInterrupt?.();
 		const run = async () => {
 			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		};
+		// Already inside a run, so these go to the agent rather than through the session's own
+		// entry points, which would refuse a run that is under way.
+		const steps: TurnSteps = {
+			record: async () => record(),
+			interrupted: () => this.agent.interrupted,
+			modelCall: () => this.agent.modelCall(),
+			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
+			sealStep: async (results, options) => {
+				const outcome = await this.agent.sealStep(results, options?.expectCalls);
+				// Retries and compaction live here, so a stepped turn keeps both.
+				const needsAnotherPass =
+					options?.postRun === false ? false : await this._postSealPass(options?.retryAttempt);
+				return {
+					done: !outcome.hasMoreToolCalls && !needsAnotherPass,
+					retryAttempt: this._retryAttempt,
+				};
+			},
+			// The turn's own run window is `_drive`'s, so there is nothing here to give up on.
+			abandonStep: async () => {},
 		};
 		try {
 			// An extension can take over when the turn runs. It is handed the same run(), so a
@@ -1085,7 +1143,7 @@ export class AgentSession {
 			if (!registered) {
 				await run();
 			} else {
-				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run });
+				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run, steps });
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
@@ -1105,7 +1163,11 @@ export class AgentSession {
 			return false;
 		}
 
-		await this._drive(() => this.agent.continue());
+		// prepareStep settled what the stop left behind, so the transcript needs nothing added.
+		await this._drive(
+			() => this.agent.continue(),
+			() => {},
+		);
 		return true;
 	}
 
@@ -1129,15 +1191,7 @@ export class AgentSession {
 
 		const dangling = findDanglingToolCalls(messages);
 		if (dangling.length > 0) {
-			const settled: ToolResultMessage[] = dangling.map((toolCall) => ({
-				role: "toolResult",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				content: [{ type: "text", text: INTERRUPTED_TOOL_CALL_RESULT }],
-				details: {},
-				isError: true,
-				timestamp: Date.now(),
-			}));
+			const settled: ToolResultMessage[] = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
 			this._recordMessages(settled);
 			return true;
 		}
@@ -1218,6 +1272,112 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * The model call of one step, without running the tools it asks for. Each reported call is
+	 * recorded in the transcript and left for the caller to run, which is what lets a call have
+	 * a retry policy, a timeout or an approval of its own.
+	 *
+	 * The run stays open until sealStep() closes it, so the three calls are one step and not
+	 * three. `replayed` says the transcript already held the response and no model call was
+	 * made, which is the answer a caller that lost its record of the call gets back.
+	 */
+	async modelCall(): Promise<AgentModelCallOutcome> {
+		if (this._isAgentRunActive) {
+			// Not "the response ended the run". A caller told that seals a step it never opened,
+			// which closes the previous one a second time.
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		this._isAgentRunActive = true;
+		try {
+			return await this.agent.modelCall();
+		} catch (error) {
+			// The step never opened, so nothing is left to seal and the run must not stay marked
+			// as active.
+			await this._emitAgentSettled();
+			throw error;
+		}
+	}
+
+	/**
+	 * Run one call the current step recorded, and report its result rather than entering it in
+	 * the transcript. The results of a step go in together, in the order the model asked for
+	 * the calls, so a caller running them out of order still leaves the transcript pi's own.
+	 *
+	 * Undefined means the transcript already held a result for the call, so nothing ran.
+	 */
+	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+		return this.agent.runToolCall(toolCallId);
+	}
+
+	/**
+	 * Close the step: record its results, decide whether the turn keeps going, and settle the
+	 * run. Every step ends here, including one whose model call ran no tools and one whose
+	 * model call failed, because the retry and the compaction that answer for those live here.
+	 */
+	async sealStep(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		options: {
+			expectCalls?: ReadonlyArray<string>;
+			retryAttempt?: number;
+			/** Record the results and stop. What answers for a step that went wrong is a provider
+			 * retry or a compaction, and neither is work to do on a turn the user just stopped. */
+			postRun?: boolean;
+		} = {},
+	): Promise<{ done: boolean; retryAttempt: number }> {
+		try {
+			const outcome = await this.agent.sealStep(toolCalls, options.expectCalls);
+			const needsAnotherPass = options.postRun === false ? false : await this._postSealPass(options.retryAttempt);
+			// Handed back so a caller that outlives this session can carry it to the next seal. The
+			// transcript can say the same thing, but a compaction rewrites the transcript.
+			return {
+				done: !outcome.hasMoreToolCalls && !needsAnotherPass,
+				retryAttempt: this._retryAttempt,
+			};
+		} finally {
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled();
+		}
+	}
+
+	/**
+	 * The post-run pass for a step whose model call this session did not make, or made in an
+	 * attempt whose answer was lost. `_handlePostAgentRun` reads a field the run's own events set
+	 * and consumes, so on either path it finds nothing and reports a turn that is over: a provider
+	 * error never retries and a full context never compacts.
+	 */
+	private async _postSealPass(retryAttempt?: number): Promise<boolean> {
+		// Before anything derived from a message, because this is the case where the message is gone.
+		if (this._pendingRetry) {
+			return true;
+		}
+		if (!this._lastAssistantMessage) {
+			this._lastAssistantMessage = this._findLastAssistantMessage();
+			// Only when this session has not counted any itself. A seal that already retried holds
+			// the real number, and a count taken from anywhere else would take the budget back to
+			// the start. A caller that keeps the count somewhere durable is believed over the
+			// transcript, which a compaction can rewrite.
+			if (this._retryAttempt === 0) {
+				this._retryAttempt = retryAttempt ?? Math.max(0, this._countTrailingFailures() - 1);
+			}
+		}
+		return this._handlePostAgentRun();
+	}
+
+	/**
+	 * Give up on a step without closing it. A driver that stops between the model call and the
+	 * seal leaves the run marked active, and a session in that state cannot be interrupted,
+	 * resumed or stepped again: `waitForIdle` never settles and `prepareStep` refuses.
+	 */
+	async abandonStep(): Promise<void> {
+		this._pendingRetry = false;
+		this._retryAttempt = 0;
+		this._systemPromptOverride = undefined;
+		this._flushPendingBashMessages();
+		await this._emitAgentSettled();
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
@@ -1226,16 +1386,23 @@ export class AgentSession {
 		}
 
 		if (this._isRetryableError(msg) && (await this._prepareRetry(msg))) {
+			this._pendingRetry = true;
 			return true;
 		}
 
-		if (msg.stopReason === "error" && this._retryAttempt > 0) {
-			this._emit({
-				type: "auto_retry_end",
-				success: false,
-				attempt: this._retryAttempt,
-				finalError: msg.errorMessage,
-			});
+		if (msg.stopReason === "error") {
+			if (this._retryAttempt > 0) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: msg.errorMessage,
+				});
+				this._retryAttempt = 0;
+			}
+		} else {
+			// A step that got an answer spends none of the budget. A live session resets on the
+			// message event; a session rebuilt per activity never sees one, so it resets here.
 			this._retryAttempt = 0;
 		}
 

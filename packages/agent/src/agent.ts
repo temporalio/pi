@@ -7,7 +7,17 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { type AgentStepOutcome, runAgentLoop, runAgentLoopContinue, runAgentStep } from "./agent-loop.ts";
+import {
+	type AgentModelCallOutcome,
+	type AgentStepOutcome,
+	runAgentLoop,
+	runAgentLoopContinue,
+	runAgentModelCall,
+	runAgentSeal,
+	runAgentStep,
+	runAgentToolCall,
+	type TurnToolCallOutcome,
+} from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -202,6 +212,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private _interrupted = false;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -317,7 +328,22 @@ export class Agent {
 
 	/** Abort the current run, if one is active. */
 	abort(): void {
+		this._interrupted = true;
 		this.activeRun?.abortController.abort();
+	}
+
+	/**
+	 * Whether a stop was asked for since the turn started. An abort reaches the unit of work that
+	 * is running, and a turn driven a step at a time has more units after it, each with a signal of
+	 * its own. A driver that does not ask this runs work the user stopped.
+	 */
+	get interrupted(): boolean {
+		return this._interrupted;
+	}
+
+	/** Start a fresh turn. Callers that drive the steps themselves own the turn boundary. */
+	clearInterrupt(): void {
+		this._interrupted = false;
 	}
 
 	/**
@@ -354,6 +380,8 @@ export class Agent {
 			);
 		}
 		const messages = this.normalizePromptInput(input, images);
+		// A new prompt is a new turn, so a stop asked for during the last one does not carry in.
+		this._interrupted = false;
 		await this.runPromptMessages(messages);
 	}
 
@@ -371,12 +399,15 @@ export class Agent {
 		if (lastMessage.role === "assistant") {
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
+				// A queued message starts a turn of its own, same as prompt().
+				this._interrupted = false;
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
+				this._interrupted = false;
 				await this.runPromptMessages(queuedFollowUps);
 				return;
 			}
@@ -408,6 +439,73 @@ export class Agent {
 		}
 
 		return await this.runSingleStep();
+	}
+
+	/**
+	 * The model call of one step, without the tools it asks for. Each reported call can then
+	 * run as its own unit of work, which is where a retry policy, a timeout or an approval
+	 * goes. The caller runs them and then calls sealStep(), including when nothing was run.
+	 */
+	async modelCall(): Promise<AgentModelCallOutcome> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		// A failed run is handled inside the lifecycle, so the default stands and the caller
+		// dispatches nothing.
+		let outcome: AgentModelCallOutcome = {
+			toolCalls: [],
+			sequential: false,
+			ended: true,
+			replayed: false,
+		};
+		await this.runWithLifecycle(async (signal) => {
+			outcome = await runAgentModelCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+			);
+		});
+		return outcome;
+	}
+
+	/**
+	 * Run one call the current step recorded. Undefined means the transcript already held a
+	 * result for it, so nothing ran. One at a time: two calls of the same step run
+	 * concurrently only when they run against agents of their own.
+	 */
+	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+		return this.runStepUnit((signal) =>
+			runAgentToolCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCallId,
+				(event) => this.processEvents(event),
+				signal,
+			),
+		);
+	}
+
+	/**
+	 * Close the current step with its results, in the order the model asked for the calls.
+	 * `expectCalls` names the step being closed, so a seal cannot attribute them to a message
+	 * something else appended in between.
+	 */
+	async sealStep(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		expectCalls?: ReadonlyArray<string>,
+	): Promise<AgentStepOutcome> {
+		return this.runStepUnit(() =>
+			runAgentSeal(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCalls,
+				(event) => this.processEvents(event),
+				expectCalls,
+			),
+		);
 	}
 
 	private normalizePromptInput(
@@ -542,6 +640,34 @@ export class Agent {
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
+		} finally {
+			this.finishRun();
+		}
+	}
+
+	/**
+	 * The same run window as runWithLifecycle, except that a failure is the caller's. A tool
+	 * call and a seal both happen after the step's message is recorded, so turning a failure
+	 * into an assistant message would leave one sitting behind a message still being settled,
+	 * and the calls it hides would stop reading as unsettled.
+	 */
+	private async runStepUnit<T>(executor: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		const abortController = new AbortController();
+		let resolvePromise = () => {};
+		const promise = new Promise<void>((resolve) => {
+			resolvePromise = resolve;
+		});
+		this.activeRun = { promise, resolve: resolvePromise, abortController };
+
+		this._state.isStreaming = true;
+		this._state.streamingMessage = undefined;
+
+		try {
+			return await executor(abortController.signal);
 		} finally {
 			this.finishRun();
 		}
