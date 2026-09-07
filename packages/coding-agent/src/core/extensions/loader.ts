@@ -44,6 +44,8 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
+	TurnExecutor,
+	TurnExecutorOptions,
 } from "./types.ts";
 
 /** Modules available to extensions via virtualModules (for compiled binaries) */
@@ -341,6 +343,11 @@ function createExtensionAPI(
 		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
 			assertActive();
 			extension.markdownTransformer = transformer;
+		},
+
+		registerTurnExecutor(executor: TurnExecutor, options?: TurnExecutorOptions): void {
+			runtime.assertActive();
+			extension.turnExecutor = { executor, ...options };
 		},
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
