@@ -143,11 +143,241 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+export interface AgentStepOutcome {
+	messages: AgentMessage[];
+	/** True when the turn ran tools whose results still need another step. */
+	hasMoreToolCalls: boolean;
+}
+
+/**
+ * Run exactly one iteration of the loop against the current context, adding no
+ * new message. Like agentLoopContinue, the last message must convert to a `user`
+ * or `toolResult` message. Used to drive a turn one step at a time from outside.
+ *
+ * A step is one turn, not a whole run, so it emits no `agent_start`. The run ends
+ * only when the turn itself ends it, on an error, an abort, or a stop decision.
+ */
+export function agentStep(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): EventStream<AgentEvent, AgentStepOutcome> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot step from message role: assistant");
+	}
+
+	// A step has no single terminating event, so the stream closes when the step
+	// resolves. That also carries the outcome, which no event holds.
+	const stream = new EventStream<AgentEvent, AgentStepOutcome>(
+		() => false,
+		() => ({ messages: [], hasMoreToolCalls: false }),
+	);
+
+	void runAgentStep(
+		context,
+		config,
+		async (event) => {
+			stream.push(event);
+		},
+		signal,
+		streamFn,
+	).then((outcome) => {
+		stream.end(outcome);
+	});
+
+	return stream;
+}
+
+export async function runAgentStep(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentStepOutcome> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot step from message role: assistant");
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context };
+
+	const outcome = await runSingleTurn({
+		context: currentContext,
+		config,
+		newMessages,
+		pendingMessages: [],
+		emitTurnStart: true,
+		fetchNextPending: false,
+		signal,
+		emit,
+		streamFunction: streamFn ?? getDefaultStreamFn(),
+	});
+
+	return { messages: newMessages, hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls };
+}
+
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+interface SingleTurnParams {
+	context: AgentContext;
+	config: AgentLoopConfig;
+	newMessages: AgentMessage[];
+	pendingMessages: AgentMessage[];
+	// The turn this one follows, when it follows one. Preparation belongs to the turn that comes
+	// after, not to the one that just ended: it can be long-running (a compaction), and running it
+	// at the end would make the last turn of a run pay for a turn nobody asked for and would hand
+	// the stop decision a context it never saw.
+	previousTurn?: PrepareNextTurnContext;
+	// The first iteration of a run does not emit turn_start; the run entry point
+	// already emitted it.
+	emitTurnStart: boolean;
+	// Whether to drain the steering queue after the turn. A one-shot step leaves
+	// the queues to the caller instead of consuming a message it will not run.
+	fetchNextPending: boolean;
+	signal: AbortSignal | undefined;
+	emit: AgentEventSink;
+	streamFunction: StreamFn;
+}
+
+interface SingleTurnOutcome {
+	// True once agent_end has been emitted (an error/abort or a stop decision); the
+	// caller must return without emitting agent_end again.
+	done: boolean;
+	hasMoreToolCalls: boolean;
+	context: AgentContext;
+	config: AgentLoopConfig;
+	pendingMessages: AgentMessage[];
+	// What this turn produced, for the caller to hand to the next one as `previousTurn`. Absent
+	// when the turn ended on an error or an abort, which is not a turn to prepare from.
+	completedTurn?: PrepareNextTurnContext;
+}
+
+/**
+ * One iteration of the agent loop: inject any pending messages, stream a single
+ * assistant response, run the tools it requests, and report whether the loop
+ * should keep going.
+ */
+async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
+	const { newMessages, signal, emit, streamFunction: streamFn } = params;
+	let currentContext = params.context;
+	let config = params.config;
+	let pendingMessages = params.pendingMessages;
+
+	if (params.previousTurn) {
+		const nextTurnSnapshot = await config.prepareNextTurn?.(params.previousTurn);
+		if (nextTurnSnapshot) {
+			currentContext = nextTurnSnapshot.context ?? currentContext;
+			config = {
+				...config,
+				model: nextTurnSnapshot.model ?? config.model,
+				reasoning:
+					nextTurnSnapshot.thinkingLevel === undefined
+						? config.reasoning
+						: nextTurnSnapshot.thinkingLevel === "off"
+							? undefined
+							: nextTurnSnapshot.thinkingLevel,
+			};
+		}
+		// Preparation can be long-running (for example, compaction). Pick up steering
+		// queued while it ran. Only poll again if the earlier poll returned nothing;
+		// otherwise one-at-a-time mode would deliver two messages in this turn.
+		if (pendingMessages.length === 0) {
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+		}
+	}
+
+	if (params.emitTurnStart) {
+		await emit({ type: "turn_start" });
+	}
+
+	if (pendingMessages.length > 0) {
+		for (const message of pendingMessages) {
+			await emit({ type: "message_start", message });
+			await emit({ type: "message_end", message });
+			currentContext.messages.push(message);
+			newMessages.push(message);
+		}
+	}
+
+	const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+	newMessages.push(message);
+
+	if (message.stopReason === "error" || message.stopReason === "aborted") {
+		await emit({ type: "turn_end", message, toolResults: [] });
+		await emit({ type: "agent_end", messages: newMessages });
+		return {
+			done: true,
+			hasMoreToolCalls: false,
+			context: currentContext,
+			config,
+			pendingMessages: [],
+		};
+	}
+
+	const toolCalls = message.content.filter((c) => c.type === "toolCall");
+
+	const toolResults: ToolResultMessage[] = [];
+	let hasMoreToolCalls = false;
+	if (toolCalls.length > 0) {
+		// A "length" stop means the output was cut off by the token limit, so
+		// every tool call in the message may carry truncated arguments. Fail
+		// them all instead of executing potentially borked calls.
+		const executedToolBatch =
+			message.stopReason === "length"
+				? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+				: await executeToolCalls(currentContext, message, config, signal, emit);
+		toolResults.push(...executedToolBatch.messages);
+		hasMoreToolCalls = !executedToolBatch.terminate;
+
+		for (const result of toolResults) {
+			currentContext.messages.push(result);
+			newMessages.push(result);
+		}
+	}
+
+	await emit({ type: "turn_end", message, toolResults });
+
+	const completedTurn = {
+		message,
+		toolResults,
+		context: currentContext,
+		newMessages,
+	};
+
+	if (await config.shouldStopAfterTurn?.(completedTurn)) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return {
+			done: true,
+			hasMoreToolCalls,
+			context: currentContext,
+			config,
+			pendingMessages: [],
+			completedTurn,
+		};
+	}
+
+	const steering = params.fetchNextPending ? await config.getSteeringMessages?.() : undefined;
+	return {
+		done: false,
+		hasMoreToolCalls,
+		context: currentContext,
+		config,
+		pendingMessages: steering || [],
+		completedTurn,
+	};
 }
 
 /**
@@ -164,6 +394,8 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	// The run entry point already emitted turn_start for the first one.
+	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -173,88 +405,27 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
-			if (lastCompletedTurn) {
-				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
-				if (nextTurnSnapshot) {
-					currentContext = nextTurnSnapshot.context ?? currentContext;
-					config = {
-						...config,
-						model: nextTurnSnapshot.model ?? config.model,
-						reasoning:
-							nextTurnSnapshot.thinkingLevel === undefined
-								? config.reasoning
-								: nextTurnSnapshot.thinkingLevel === "off"
-									? undefined
-									: nextTurnSnapshot.thinkingLevel,
-					};
-				}
-				// Preparation can be long-running (for example, compaction). Pick up steering
-				// queued while it ran. Only poll again if the earlier poll returned nothing;
-				// otherwise one-at-a-time mode would deliver two messages in this turn.
-				if (pendingMessages.length === 0) {
-					pendingMessages = (await config.getSteeringMessages?.()) || [];
-				}
-				await emit({ type: "turn_start" });
-			}
-
-			// Process pending messages (inject before next assistant response)
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-				}
-				pendingMessages = [];
-			}
-
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
-			newMessages.push(message);
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
-
-			const toolResults: ToolResultMessage[] = [];
-			hasMoreToolCalls = false;
-			if (toolCalls.length > 0) {
-				// A "length" stop means the output was cut off by the token limit, so
-				// every tool call in the message may carry truncated arguments. Fail
-				// them all instead of executing potentially borked calls.
-				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
-				toolResults.push(...executedToolBatch.messages);
-				hasMoreToolCalls = !executedToolBatch.terminate;
-
-				for (const result of toolResults) {
-					currentContext.messages.push(result);
-					newMessages.push(result);
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults });
-
-			lastCompletedTurn = {
-				message,
-				toolResults,
+			const outcome = await runSingleTurn({
 				context: currentContext,
+				config,
 				newMessages,
-			};
-
-			if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
-				await emit({ type: "agent_end", messages: newMessages });
+				pendingMessages,
+				previousTurn: lastCompletedTurn,
+				emitTurnStart: !firstTurn,
+				fetchNextPending: true,
+				signal,
+				emit,
+				streamFunction,
+			});
+			firstTurn = false;
+			if (outcome.done) {
 				return;
 			}
-
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			lastCompletedTurn = outcome.completedTurn;
+			hasMoreToolCalls = outcome.hasMoreToolCalls;
+			currentContext = outcome.context;
+			config = outcome.config;
+			pendingMessages = outcome.pendingMessages;
 		}
 
 		// Agent would stop here. Check for follow-up messages.
