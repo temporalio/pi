@@ -16,6 +16,7 @@ import {
 	runAgentSeal,
 	runAgentStep,
 	runAgentToolCall,
+	type StepCursor,
 	type TurnToolCallOutcome,
 } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
@@ -425,6 +426,13 @@ export class Agent {
 	 * the turn still needs another step, so it does not repeat the loop's own
 	 * termination logic.
 	 */
+	/**
+	 * What the last step left for the next one, and what the current step prepared. The loop keeps
+	 * this in a local when it drives itself; a caller stepping from outside has no such local, so
+	 * the agent holds it. See `StepCursor`.
+	 */
+	private stepCursor: StepCursor = {};
+
 	async step(): Promise<AgentStepOutcome> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before stepping.");
@@ -466,6 +474,7 @@ export class Agent {
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFunction,
+				this.stepCursor,
 			);
 		});
 		return outcome;
@@ -484,6 +493,7 @@ export class Agent {
 				toolCallId,
 				(event) => this.processEvents(event),
 				signal,
+				this.stepCursor,
 			),
 		);
 	}
@@ -504,6 +514,7 @@ export class Agent {
 				toolCalls,
 				(event) => this.processEvents(event),
 				expectCalls,
+				this.stepCursor,
 			),
 		);
 	}
@@ -531,6 +542,9 @@ export class Agent {
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
+		// The loop keeps its own completed turn, and a new prompt is a new run: the turn before it
+		// is not one this run prepares from. Anything a stepping caller left is spent here.
+		this.stepCursor = {};
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
 				messages,
@@ -544,6 +558,7 @@ export class Agent {
 	}
 
 	private async runContinuation(): Promise<void> {
+		this.stepCursor = {};
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
@@ -566,6 +581,7 @@ export class Agent {
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFunction,
+				this.stepCursor,
 			);
 		});
 		return outcome;
