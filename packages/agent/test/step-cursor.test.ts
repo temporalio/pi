@@ -13,13 +13,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
 import { runAgentModelCall, type StepCursor } from "../src/agent-loop.ts";
-import type {
-	AgentContext,
-	AgentLoopConfig,
-	AgentMessage,
-	AgentTool,
-	PrepareNextTurnContext,
-} from "../src/types.ts";
+import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool, PrepareNextTurnContext } from "../src/types.ts";
 
 const LLM_ROLES = ["user", "assistant", "toolResult"];
 
@@ -226,9 +220,9 @@ describe("the step cursor", () => {
 		}) as never;
 
 		for (const _attempt of [1, 2]) {
-			await expect(
-				runAgentModelCall(context, config, async () => {}, undefined, streamFn, cursor),
-			).rejects.toThrow("provider is down");
+			await expect(runAgentModelCall(context, config, async () => {}, undefined, streamFn, cursor)).rejects.toThrow(
+				"provider is down",
+			);
 		}
 
 		expect(prepared).toBe(1);
