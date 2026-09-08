@@ -1079,11 +1079,32 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this._writeGuard?.();
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
 	}
+
+	/**
+	 * Asked immediately before every entry is written, and expected to throw when this process is
+	 * no longer entitled to write. It runs before the in-memory leaf moves, so a rejected append
+	 * leaves the session as it was.
+	 *
+	 * For a driver that owns the session file from outside. Every entry takes its parent from the
+	 * leaf its writer last saw, so two writers do not corrupt the file, they branch it, and the
+	 * branch nobody reads is the half of a turn that disappears. A driver that checks before
+	 * starting a model call has still not checked before the write that model call ends with,
+	 * which can be minutes later. This is the only place that is always immediately before a write.
+	 *
+	 * Synchronous because the whole append path is: a guard that has to await cannot go here. It is
+	 * a callback, not a transaction: it says who may write, not that nobody else is writing.
+	 */
+	setWriteGuard(guard: (() => void) | undefined): void {
+		this._writeGuard = guard;
+	}
+
+	private _writeGuard?: () => void;
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
 	 * Does not allow writing CompactionSummaryMessage and BranchSummaryMessage directly.

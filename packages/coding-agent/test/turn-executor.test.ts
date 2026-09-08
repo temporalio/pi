@@ -6,6 +6,7 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, getMode
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { TurnSteps } from "../src/core/extensions/index.ts";
 import { discoverAndLoadExtensions } from "../src/core/extensions/loader.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -33,6 +34,16 @@ const usage = {
 	cacheWrite: 0,
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/** For a test about which executor wins, where the turn itself is beside the point. */
+const noSteps: TurnSteps = {
+	record: async () => {},
+	interrupted: () => false,
+	modelCall: async () => ({ toolCalls: [], sequential: false, ended: true, replayed: false }),
+	runToolCall: async () => undefined,
+	sealStep: async () => ({ done: true, retryAttempt: 0 }),
+	abandonStep: async () => {},
 };
 
 function assistant(text: string): AssistantMessage {
@@ -129,7 +140,7 @@ describe("turn executor", () => {
 		);
 		const registered = runner.getTurnExecutor();
 		expect(registered).toBeDefined();
-		await registered?.executor({ sessionId: "s", run: async () => {} });
+		await registered?.executor({ sessionId: "s", run: async () => {}, steps: noSteps });
 		expect((globalThis as any).turnsSeen).toBe("first");
 	});
 
@@ -150,6 +161,39 @@ describe("turn executor", () => {
 		expect(seen[0]).toBe((session as AgentSession).sessionManager.getSessionId());
 
 		// And the turn itself is the ordinary one: prompt, one model call, the answer.
+		expect(modelCalls).toBe(1);
+		const messages = (session as AgentSession).agent.state.messages;
+		expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "answer" });
+	});
+
+	it("runs the same turn through an executor that drives the steps itself", async () => {
+		await createSession(
+			`export default p => p.registerTurnExecutor(async turn => {
+				await turn.steps.record();
+				for (;;) {
+					const model = await turn.steps.modelCall();
+					const results = [];
+					if (!model.ended) {
+						for (const call of model.toolCalls) {
+							const result = await turn.steps.runToolCall(call.id);
+							if (result) results.push(result);
+						}
+					}
+					globalThis.turnsSeen = (globalThis.turnsSeen ?? []).concat("step");
+					const sealed = await turn.steps.sealStep(results);
+					if (sealed.done) return;
+				}
+			});`,
+		);
+
+		await (session as AgentSession).prompt("go");
+		await (session as AgentSession).waitForIdle();
+
+		// One step, and the same turn as the one pi would have run: the prompt reached the
+		// transcript without a model call of its own, and the answer is where run() leaves it.
+		expect((globalThis as any).turnsSeen).toEqual(["step"]);
 		expect(modelCalls).toBe(1);
 		const messages = (session as AgentSession).agent.state.messages;
 		expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
