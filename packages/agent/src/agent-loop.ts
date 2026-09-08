@@ -149,49 +149,6 @@ export interface AgentStepOutcome {
 	hasMoreToolCalls: boolean;
 }
 
-/**
- * Run exactly one iteration of the loop against the current context, adding no
- * new message. Like agentLoopContinue, the last message must convert to a `user`
- * or `toolResult` message. Used to drive a turn one step at a time from outside.
- *
- * A step is one turn, not a whole run, so it emits no `agent_start`. The run ends
- * only when the turn itself ends it, on an error, an abort, or a stop decision.
- */
-export function agentStep(
-	context: AgentContext,
-	config: AgentLoopConfig,
-	signal: AbortSignal | undefined,
-	streamFn: StreamFn,
-): EventStream<AgentEvent, AgentStepOutcome> {
-	if (context.messages.length === 0) {
-		throw new Error("Cannot step: no messages in context");
-	}
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot step from message role: assistant");
-	}
-
-	// A step has no single terminating event, so the stream closes when the step
-	// resolves. That also carries the outcome, which no event holds.
-	const stream = new EventStream<AgentEvent, AgentStepOutcome>(
-		() => false,
-		() => ({ messages: [], hasMoreToolCalls: false }),
-	);
-
-	void runAgentStep(
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((outcome) => {
-		stream.end(outcome);
-	});
-
-	return stream;
-}
-
 export async function runAgentStep(
 	context: AgentContext,
 	config: AgentLoopConfig,
@@ -231,19 +188,19 @@ export interface AgentModelCallOutcome {
 	sequential: boolean;
 	/**
 	 * The response ended the run on its own (an error or an abort). There is nothing to
-	 * dispatch and nothing to seal.
+	 * dispatch. The caller still seals to run its post-response policy.
 	 */
 	ended: boolean;
 	/**
-	 * The transcript already held the response, so no model call was made. A driver whose
-	 * record of the call was lost gets the same answer back instead of paying for it twice,
-	 * and the calls it reports are ones nothing has run yet.
+	 * The transcript already held the response, so no model call was made. The caller must
+	 * still check dispatch admission and recorded results before running the returned calls.
+	 * A replay does not establish whether any tool already ran.
 	 */
 	replayed: boolean;
 }
 
 /**
- * The model call of one step, on its own. The calls it reports are recorded but not run, so a
+ * The model call of one step, on its own. This entry point does not run the recorded calls, so a
  * caller can put each of them somewhere the loop cannot see: its own unit of work, its own
  * retry policy, its own approval.
  */
@@ -298,7 +255,7 @@ export async function runAgentModelCall(
 
 /**
  * Run one recorded call of the current step. Returns undefined when the transcript already
- * holds a result for it, which is the at-least-once case: nothing runs a second time.
+ * holds a result with the same call id. Concurrent dispatch admission belongs to the caller.
  */
 export async function runAgentToolCall(
 	context: AgentContext,
@@ -420,25 +377,9 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-interface SingleTurnParams {
-	context: AgentContext;
-	config: AgentLoopConfig;
-	newMessages: AgentMessage[];
-	pendingMessages: AgentMessage[];
-	// The turn this one follows, when it follows one. Preparation belongs to the turn that comes
-	// after, not to the one that just ended: it can be long-running (a compaction), and running it
-	// at the end would make the last turn of a run pay for a turn nobody asked for and would hand
-	// the stop decision a context it never saw.
-	previousTurn?: PrepareNextTurnContext;
-	// The first iteration of a run does not emit turn_start; the run entry point
-	// already emitted it.
-	emitTurnStart: boolean;
-	// Whether to drain the steering queue after the turn. A one-shot step leaves
-	// the queues to the caller instead of consuming a message it will not run.
+interface SingleTurnParams extends TurnModelCallParams {
+	// A one-shot step leaves queued messages for the caller to admit.
 	fetchNextPending: boolean;
-	signal: AbortSignal | undefined;
-	emit: AgentEventSink;
-	streamFunction: StreamFn;
 }
 
 interface SingleTurnOutcome {
@@ -454,7 +395,7 @@ interface SingleTurnOutcome {
 	completedTurn?: PrepareNextTurnContext;
 }
 
-export interface TurnModelCallParams {
+interface TurnModelCallParams {
 	context: AgentContext;
 	config: AgentLoopConfig;
 	newMessages: AgentMessage[];
@@ -470,7 +411,7 @@ export interface TurnModelCallParams {
 	streamFunction: StreamFn;
 }
 
-export interface TurnModelCallOutcome {
+interface TurnModelCallOutcome {
 	message: AssistantMessage;
 	/** The calls the model asked for, in the order it asked for them. */
 	toolCalls: AgentToolCall[];
@@ -484,7 +425,7 @@ export interface TurnModelCallOutcome {
 	config: AgentLoopConfig;
 }
 
-export interface TurnToolCallParams {
+interface TurnToolCallParams {
 	context: AgentContext;
 	/** The message that asked for this call. Its stop reason decides whether the call may run. */
 	assistantMessage: AssistantMessage;
@@ -500,7 +441,7 @@ export interface TurnToolCallOutcome {
 	terminate: boolean;
 }
 
-export interface SealTurnStepParams {
+interface SealTurnStepParams {
 	context: AgentContext;
 	config: AgentLoopConfig;
 	newMessages: AgentMessage[];
@@ -516,7 +457,7 @@ export interface SealTurnStepParams {
  * The model call of one step: inject any pending messages and stream a single assistant
  * response, stopping before the tools it asks for. The caller runs them.
  */
-export async function runTurnModelCall(params: TurnModelCallParams): Promise<TurnModelCallOutcome> {
+async function runTurnModelCall(params: TurnModelCallParams): Promise<TurnModelCallOutcome> {
 	const { newMessages, signal, emit, streamFunction: streamFn } = params;
 	let context = params.context;
 	let config = params.config;
@@ -579,7 +520,7 @@ export async function runTurnModelCall(params: TurnModelCallParams): Promise<Tur
  * the transcript, because the results of a step go in together, in the order the model asked
  * for them, and a caller running calls concurrently settles them out of order.
  */
-export async function runTurnToolCall(params: TurnToolCallParams): Promise<TurnToolCallOutcome> {
+async function runTurnToolCall(params: TurnToolCallParams): Promise<TurnToolCallOutcome> {
 	const { context, assistantMessage, toolCall, config, signal, emit } = params;
 
 	await emit({
@@ -604,7 +545,7 @@ export async function runTurnToolCall(params: TurnToolCallParams): Promise<TurnT
  * Close a step whose calls have settled: record their results, then decide whether the turn
  * keeps going. A step that ran no tools seals the same way.
  */
-export async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutcome> {
+async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutcome> {
 	const { newMessages, emit, message } = params;
 	const currentContext = params.context;
 	const config = params.config;

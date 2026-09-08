@@ -1213,8 +1213,9 @@ export type MarkdownTransformer = (markdown: string, context: MarkdownTransformC
  * asks for, and a seal that records their results and says whether the turn is over.
  *
  * A call's result is reported rather than entered in the transcript, because a step's results go
- * in together, in the order the model asked for the calls. That leaves an executor free to run
- * them wherever it likes and settle them in whatever order they finish.
+ * in together, in the order the model asked for the calls. An executor can therefore settle them
+ * in whatever order they finish. This handle drives the live agent, which admits one call at a
+ * time, so the concurrency is the executor's to arrange, not this handle's to provide.
  */
 export interface TurnSteps {
 	/** Put the turn's messages in the transcript without running them. */
@@ -1252,8 +1253,7 @@ export interface TurnExecutorContext {
 }
 
 /**
- * Runs a turn on pi's behalf. It must call `turn.run()` for the turn to happen; an executor that
- * returns without calling it leaves the turn unrun.
+ * An executor drives either `turn.run()` or `turn.steps`. Returning without either leaves it unrun.
  */
 export type TurnExecutor = (turn: TurnExecutorContext) => Promise<void>;
 

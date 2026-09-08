@@ -730,15 +730,7 @@ export class AgentSession {
 		return false;
 	}
 
-	/**
-	 * How many attempts of the current step already failed. Each one leaves an error message that
-	 * the next attempt drops from memory and keeps in the transcript, so the transcript is what
-	 * carries the count across a process that does not.
-	 *
-	 * That the transcript keeps them is a contract, not an accident. Dropping error entries from
-	 * the session file, or filtering them out of the context, takes the retry budget back to zero
-	 * on every attempt, and a failing provider is then asked again until the step ceiling.
-	 */
+	/** A fallback for callers without a retry count. Compaction can remove this evidence. */
 	private _countTrailingFailures(): number {
 		const messages = this.agent.state.messages;
 		let failures = 0;

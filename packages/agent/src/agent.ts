@@ -420,7 +420,7 @@ export class Agent {
 
 	/**
 	 * Advance the current transcript by exactly one step (one model call and the
-	 * tools it requests). Adds no message and does not loop. The last message must
+	 * tools it requests). Adds no prompt and does not loop. The last message must
 	 * be a user or tool-result message. `hasMoreToolCalls` tells the caller whether
 	 * the turn still needs another step, so it does not repeat the loop's own
 	 * termination logic.

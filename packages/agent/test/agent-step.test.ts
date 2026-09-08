@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentStep } from "../src/agent-loop.ts";
+import { runAgentStep } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -76,7 +76,7 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	return messages.filter((m) => LLM_ROLES.includes(m.role)) as Message[];
 }
 
-describe("agentStep", () => {
+describe("runAgentStep", () => {
 	it("runs exactly one model call and its tools, then stops", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];
@@ -128,11 +128,15 @@ describe("agentStep", () => {
 		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
 
 		const events: AgentEvent[] = [];
-		const stream = agentStep(context, config, undefined, streamFn);
-		for await (const event of stream) {
-			events.push(event);
-		}
-		const outcome = await stream.result();
+		const outcome = await runAgentStep(
+			context,
+			config,
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			streamFn,
+		);
 
 		// Exactly one model call, and the tool it requested ran once.
 		expect(callCount).toBe(1);
@@ -151,19 +155,20 @@ describe("agentStep", () => {
 		expect(outcome.messages.map((m) => m.role)).toEqual(["assistant", "toolResult"]);
 	});
 
-	it("throws when the last message is an assistant", () => {
+	it("throws when the last message is an assistant", async () => {
 		const context: AgentContext = {
 			systemPrompt: "",
 			messages: [createAssistantMessage([{ type: "text", text: "hi" }])],
 			tools: [],
 		};
-		expect(() =>
-			agentStep(
+		await expect(
+			runAgentStep(
 				context,
 				{ model: createModel(), convertToLlm: identityConverter },
+				() => {},
 				undefined,
 				() => new MockAssistantStream(),
 			),
-		).toThrow(/Cannot step from message role: assistant/);
+		).rejects.toThrow(/Cannot step from message role: assistant/);
 	});
 });
