@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolCall } from "@earendil-works/pi-agent-core";
 import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
@@ -478,6 +478,29 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 	const resolvedAgentDir = resolvePath(agentDir);
 	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 	return join(resolvedAgentDir, "sessions", safePath);
+}
+
+/**
+ * Find the unsettled tool calls of an interrupted turn. `Agent.continue()` refuses a
+ * trailing assistant message, so a turn that stopped between a tool call and its result
+ * can't be finished until each call is settled. Settling them in the transcript also
+ * keeps the record readable on its own, instead of each request having to synthesize
+ * the missing results again.
+ *
+ * Only the trailing assistant message counts. An aborted tool batch leaves older calls
+ * unresolved on purpose, and a result appended at the tail for one of those attaches to
+ * the wrong call. Errored and aborted messages are skipped because the provider never
+ * sees them, so a result for their calls has nothing to pair with.
+ */
+export function findDanglingToolCalls(messages: readonly AgentMessage[]): AgentToolCall[] {
+	const last = messages[messages.length - 1];
+	if (!last || last.role !== "assistant") {
+		return [];
+	}
+	if (last.stopReason === "error" || last.stopReason === "aborted") {
+		return [];
+	}
+	return last.content.filter((block) => block.type === "toolCall");
 }
 
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
