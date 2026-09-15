@@ -49,6 +49,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredTool,
+	RegisteredTurnExecutor,
 	ReplacedSessionContext,
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
@@ -638,6 +639,11 @@ export class ExtensionRunner {
 
 	getMarkdownTransformers(): MarkdownTransformer[] {
 		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+	}
+
+	/** The executor that runs turns, if an extension registered one. First registration wins. */
+	getTurnExecutor(): RegisteredTurnExecutor | undefined {
+		return this.extensions.find((ext) => ext.turnExecutor)?.turnExecutor;
 	}
 
 	getEntryRenderer(customType: string): EntryRenderer | undefined {
