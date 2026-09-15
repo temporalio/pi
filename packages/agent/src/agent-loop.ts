@@ -143,6 +143,52 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+export interface AgentStepOutcome {
+	messages: AgentMessage[];
+	/** True when the turn ran tools whose results still need another step. */
+	hasMoreToolCalls: boolean;
+}
+
+/**
+ * Run exactly one iteration of the loop against the current context, adding no
+ * new message. Like agentLoopContinue, the last message must convert to a `user`
+ * or `toolResult` message. Used to drive a turn one step at a time from outside.
+ *
+ * A step is one turn, not a whole run, so it emits no `agent_start`. The run ends
+ * only when the turn itself ends it, on an error, an abort, or a stop decision.
+ */
+export async function runAgentStep(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+): Promise<AgentStepOutcome> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+	if (context.messages[context.messages.length - 1].role === "assistant") {
+		throw new Error("Cannot step from message role: assistant");
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = { ...context };
+
+	const outcome = await runSingleTurn({
+		context: currentContext,
+		config,
+		newMessages,
+		pendingMessages: [],
+		emitTurnStart: true,
+		fetchNextPending: false,
+		signal,
+		emit,
+		streamFunction: streamFn ?? getDefaultStreamFn(),
+	});
+
+	return { messages: newMessages, hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls };
+}
+
 // What the transcript says about a call when nothing can say whether it ran. The tool can have had
 // its effect before the run stopped, so calling it a failure would invite a second run of something
 // that already happened.

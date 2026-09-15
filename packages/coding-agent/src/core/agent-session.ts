@@ -1129,8 +1129,8 @@ export class AgentSession {
 	 * result get one, and a trailing assistant message that holds no answer is dropped.
 	 * Returns whether the turn still has work, so false means it already has its answer.
 	 *
-	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller that drives
-	 * the turn itself wants this one, so recovery stays one step at a time.
+	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller driving
+	 * step() itself wants this one, so recovery stays one step at a time.
 	 */
 	prepareStep(): boolean {
 		if (this._isAgentRunActive) {
@@ -1197,6 +1197,32 @@ export class AgentSession {
 		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
 	}
 
+	/**
+	 * Advance the current turn by exactly one step (one model call and the tools it
+	 * requests). Unlike prompt(), it adds no message and does not loop; the caller
+	 * drives successive steps. The last recorded message must be a user or tool-result
+	 * message, which is what recordPrompt() and prepareStep() leave behind.
+	 *
+	 * `done` is false while the turn needs another step, which includes a retry or a
+	 * compaction that post-run handling asked for. Steering and follow-up queues stay
+	 * untouched, so the caller decides when a queued message enters the run.
+	 */
+	async step(): Promise<{ done: boolean }> {
+		if (this._isAgentRunActive) {
+			return { done: false };
+		}
+
+		this._isAgentRunActive = true;
+		try {
+			const outcome = await this.agent.step();
+			// Retries and compaction live here, so a stepped run keeps both.
+			const needsAnotherPass = await this._handlePostAgentRun();
+			return { done: !outcome.hasMoreToolCalls && !needsAnotherPass };
+		} finally {
+			await this._settleRun();
+		}
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
@@ -1257,6 +1283,40 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return;
+		}
+
+		options?.preflightResult?.(true);
+		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Record a prompt without running it. Everything prompt() does to build the turn
+	 * happens here (extension input, template expansion, the model and auth checks); the
+	 * model call does not. step() picks the turn up from the transcript.
+	 *
+	 * For a caller that drives a turn one step at a time and checkpoints in between.
+	 * Returns whether a prompt was recorded: an extension command handles its own text,
+	 * and a prompt sent mid-stream is queued instead.
+	 */
+	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return false;
+		}
+
+		options?.preflightResult?.(true);
+		this._recordMessages(messages);
+		return true;
+	}
+
+	/**
+	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
+	 * when the text needed no run at all.
+	 */
+	private async _buildPromptMessages(text: string, options?: PromptOptions): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1401,12 +1461,7 @@ export class AgentSession {
 			throw error;
 		}
 
-		if (!messages) {
-			return;
-		}
-
-		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**
