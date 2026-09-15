@@ -125,6 +125,7 @@ export type {
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SealStepOptions,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,
@@ -169,6 +170,7 @@ export type {
 	TurnExecutorContext,
 	TurnExecutorOptions,
 	TurnStartEvent,
+	TurnSteps,
 	UIPromptEndEvent,
 	UIPromptKind,
 	UIPromptStartEvent,
