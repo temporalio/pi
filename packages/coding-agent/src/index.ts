@@ -1,7 +1,8 @@
 // Core session management
 
+// Re-exported so a caller settling an interrupted turn from outside needs one package.
+export { type TurnToolCallOutcome, unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 export { type Args, parseArgs } from "./cli/args.ts";
-
 // Config paths
 export {
 	CONFIG_DIR_NAME,
@@ -238,6 +239,7 @@ export {
 	type CustomEntry,
 	type CustomMessageEntry,
 	type FileEntry,
+	findDanglingToolCalls,
 	getLatestCompactionEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,

@@ -25,6 +25,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import { unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 import { contentText, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -33,6 +34,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -103,7 +105,7 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { findDanglingToolCalls, getLatestCompactionEntry } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -667,24 +669,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
-			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._persistMessage(event.message);
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -1099,18 +1084,117 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._drive(() => this.agent.prompt(messages));
+	}
+
+	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
+	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await initial();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
 		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			await this._settleRun();
 		}
+	}
+
+	/** What every run ends with. */
+	private async _settleRun(): Promise<void> {
+		this._systemPromptOverride = undefined;
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		await this._emitAgentSettled();
+	}
+
+	/**
+	 * Finish a turn that stopped part way through. prepareStep() settles what the stop
+	 * left behind first, because `continue()` refuses a trailing assistant message. The
+	 * prompt is never added again, so a finished prompt does not run twice. Returns
+	 * whether it drove a run.
+	 */
+	async resumeInterruptedTurn(): Promise<boolean> {
+		if (!this.prepareStep()) {
+			return false;
+		}
+
+		// prepareStep settled what the stop left behind, so the transcript needs nothing added.
+		await this._drive(() => this.agent.continue());
+		return true;
+	}
+
+	/**
+	 * Settle what a stopped turn left behind, without calling the model: tool calls with no
+	 * result get one, and a trailing assistant message that holds no answer is dropped.
+	 * Returns whether the turn still has work, so false means it already has its answer.
+	 *
+	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller that drives
+	 * the turn itself wants this one, so recovery stays one step at a time.
+	 */
+	prepareStep(): boolean {
+		if (this._isAgentRunActive) {
+			return false;
+		}
+
+		const messages = this.agent.state.messages;
+		if (messages.length === 0) {
+			return false;
+		}
+
+		const dangling = findDanglingToolCalls(messages);
+		if (dangling.length > 0) {
+			const settled: ToolResultMessage[] = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
+			this._recordMessages(settled);
+			return true;
+		}
+
+		const last = messages[messages.length - 1];
+		if (last.role === "user" || last.role === "toolResult") {
+			return true;
+		}
+
+		if (last.role !== "assistant") {
+			return false;
+		}
+
+		// An errored or aborted assistant message holds no answer, and the provider
+		// never sees it. Drop it so the transcript ends where the model can pick up.
+		if (last.stopReason === "error" || last.stopReason === "aborted") {
+			this.agent.state.messages = messages.slice(0, -1);
+			return this.prepareStep();
+		}
+
+		return false;
+	}
+
+	/**
+	 * Put messages in the transcript without running anything. The durable record comes
+	 * first: if the write throws, memory must not hold a message the file does not, or the
+	 * next resume writes it a second time.
+	 */
+	private _recordMessages(messages: AgentMessage[]): void {
+		for (const message of messages) {
+			this._persistMessage(message);
+			this._emit({ type: "message_start", message });
+			this._emit({ type: "message_end", message });
+		}
+		this.agent.state.messages = [...this.agent.state.messages, ...messages];
+	}
+
+	/** Write one message to the session file, in the entry shape its role belongs in. */
+	private _persistMessage(message: AgentMessage): void {
+		if (message.role === "custom") {
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+			this.sessionManager.appendMessage(message);
+		}
+		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
