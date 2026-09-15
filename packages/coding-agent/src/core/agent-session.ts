@@ -27,6 +27,7 @@ import {
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	declareToolChanges,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
@@ -1760,13 +1761,7 @@ export class AgentSession {
 
 	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
 	private async _drive(initial: () => Promise<void>): Promise<void> {
-		this._agentRunAbortRequested = false;
-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
-		this._failedResponse = undefined;
-		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
+		this._beginTurn();
 		this._isAgentRunActive = true;
 		try {
 			await initial();
@@ -1787,9 +1782,23 @@ export class AgentSession {
 		}
 	}
 
-	/** What every run ends with. */
-	private async _settleRun(): Promise<void> {
-		this._runSystemPromptOptions = undefined;
+	/** What a turn starts with, before anything of it reaches the transcript. */
+	private _beginTurn(): void {
+		this._agentRunAbortRequested = false;
+		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		// The run records the loadout in the transcript; restored tools that did not register by now
+		// are dropped, so a tool that never registers does not stay pending.
+		this._pendingToolNames.clear();
+	}
+
+	/**
+	 * What every run ends with. A step that leaves its turn unfinished keeps the turn's prompt
+	 * options, or the next step would rebuild the system prompt without what the turn added to it.
+	 */
+	private async _settleRun(turnDone = true): Promise<void> {
+		if (turnDone) this._runSystemPromptOptions = undefined;
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
 		await this._emitAgentSettled();
@@ -1816,8 +1825,8 @@ export class AgentSession {
 	 * result get one, and a trailing assistant message that holds no answer is dropped.
 	 * Returns whether the turn still has work, so false means it already has its answer.
 	 *
-	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller that drives
-	 * the turn itself wants this one, so recovery stays one step at a time.
+	 * resumeInterruptedTurn() is this plus a run to the end of the turn. A caller driving
+	 * step() itself wants this one, so recovery stays one step at a time.
 	 */
 	prepareStep(): boolean {
 		if (this._isAgentRunActive) {
@@ -1895,6 +1904,35 @@ export class AgentSession {
 		}
 		if (entryId) this._entryIdsByMessage.set(message, entryId);
 		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
+	}
+
+	/**
+	 * Advance the current turn by exactly one step (one model call and the tools it
+	 * requests). Unlike prompt(), it adds no message and does not loop; the caller
+	 * drives successive steps. The last recorded message must be a user or tool-result
+	 * message, which is what recordPrompt() and prepareStep() leave behind.
+	 *
+	 * `done` is false while the turn needs another step, which includes a retry or a
+	 * compaction that post-run handling asked for. Steering and follow-up queues stay
+	 * untouched, so the caller decides when a queued message enters the run.
+	 */
+	async step(): Promise<{ done: boolean }> {
+		if (this._isAgentRunActive) {
+			return { done: false };
+		}
+
+		this._agentRunAbortRequested = false;
+		this._isAgentRunActive = true;
+		let done = true;
+		try {
+			const outcome = await this.agent.step();
+			// Retries and compaction live here, so a stepped run keeps both.
+			const needsAnotherPass = await this._handlePostAgentRun();
+			done = !outcome.hasMoreToolCalls && !needsAnotherPass;
+			return { done };
+		} finally {
+			await this._settleRun(done);
+		}
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -2017,6 +2055,44 @@ export class AgentSession {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return;
+		}
+
+		options?.preflightResult?.("started");
+		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Record a prompt without running it. Everything prompt() does to build the turn
+	 * happens here (extension input, template expansion, the model and auth checks); the
+	 * model call does not. step() picks the turn up from the transcript.
+	 *
+	 * For a caller that drives a turn one step at a time and checkpoints in between.
+	 * Returns whether a prompt was recorded: an extension command handles its own text,
+	 * and a prompt sent mid-stream is queued instead.
+	 */
+	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return false;
+		}
+
+		options?.preflightResult?.("started");
+		this._beginTurn();
+		// The loop declares a prompt's loadout as it adds the prompt; a recorded one never reaches it.
+		this._recordMessages(
+			declareToolChanges({ messages: this.agent.state.messages, tools: this.agent.state.tools }, messages),
+		);
+		return true;
+	}
+
+	/**
+	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
+	 * when the text needed no run at all.
+	 */
+	private async _buildPromptMessages(text: string, options?: PromptOptions): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -2153,8 +2229,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**
