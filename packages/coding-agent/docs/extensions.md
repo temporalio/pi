@@ -212,6 +212,33 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+### Turn executors
+
+Take over when a turn runs. Pi hands the executor the turn instead of running it, and the executor decides when to call `run()`.
+
+```typescript
+pi.registerTurnExecutor(async (turn) => {
+  console.error(`turn on session ${turn.sessionId}`);
+  await turn.run();
+});
+```
+
+The executor runs in this process against the live session, so the transcript, the events, and the streaming are the same as a turn Pi ran itself. `run()` is the whole turn: the prompt, the model calls, the tools, and the retries and compaction that follow them.
+
+An executor that returns without calling `run()` leaves the turn unrun, prompt included, which is how you hold a turn. Call `ctx.abort()` to stop one that is already running.
+
+One executor wins: the first extension to register one. Register none and Pi runs turns itself, which is the default.
+
+Pass `resumeOnStart` to also be handed a turn an earlier run left unfinished, when the session opens:
+
+```typescript
+pi.registerTurnExecutor(runTurn, { resumeOnStart: true });
+```
+
+A crash during a tool call leaves the session with a tool call and no result, and Pi does not finish it on its own. With `resumeOnStart`, opening the session hands that turn to the executor: the unanswered call is settled as an unknown outcome, and the turn runs on. A session whose last turn finished is left alone. It is off by default because finishing a turn is a model call the user did not ask for in this session.
+
+This is the hook for putting the loop under something else, such as a scheduler that serialises turns across sessions, or a durable executor that records each turn and re-runs one that a crash interrupted.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

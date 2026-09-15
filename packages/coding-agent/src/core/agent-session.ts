@@ -1759,11 +1759,11 @@ export class AgentSession {
 		await this._drive(() => this.agent.prompt(messages));
 	}
 
-	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
+	/** Run a turn to its end, through an executor if one registered. */
 	private async _drive(initial: () => Promise<void>): Promise<void> {
 		this._beginTurn();
 		this._isAgentRunActive = true;
-		try {
+		const run = async () => {
 			await initial();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
@@ -1774,6 +1774,16 @@ export class AgentSession {
 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested) break;
 				await this.agent.continue();
+			}
+		};
+		try {
+			// An extension can take over when the turn runs. It is handed the same run(), so a
+			// turn that goes through an executor and one that does not are the same turn.
+			const registered = this._extensionRunner.getTurnExecutor();
+			if (!registered) {
+				await run();
+			} else {
+				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run });
 			}
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -3401,6 +3411,12 @@ export class AgentSession {
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		this._extensionRunner.reportUnhandledMcpServers();
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+
+		// An executor that asked for it gets the turn an earlier run left unfinished. This goes
+		// through _drive, so the executor sees it as a turn like any other.
+		if (this._extensionRunner.getTurnExecutor()?.resumeOnStart) {
+			await this.resumeInterruptedTurn();
+		}
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
