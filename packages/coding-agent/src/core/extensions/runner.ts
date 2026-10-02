@@ -70,6 +70,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	RegisteredTool,
+	RegisteredTurnExecutor,
 	ReplacedSessionContext,
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
@@ -792,6 +793,11 @@ export class ExtensionRunner {
 		const resolve = (index: number): ToolRenderers | undefined =>
 			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
 		return resolve(0);
+	}
+
+	/** The executor that runs turns, if an extension registered one. First registration wins. */
+	getTurnExecutor(): RegisteredTurnExecutor | undefined {
+		return this.extensions.find((ext) => ext.turnExecutor)?.turnExecutor;
 	}
 
 	getEntryRenderer(customType: string): EntryRenderer | undefined {

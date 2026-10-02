@@ -437,6 +437,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
 				emitToolCall: (event: { type: string; toolCallId: string }) => Promise<undefined>;
+				getTurnExecutor: () => undefined;
 				emitInput: (
 					text: string,
 					images: unknown,
@@ -464,6 +465,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				);
 				return undefined;
 			},
+			getTurnExecutor: () => undefined,
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async (_prompt, _images, systemPromptOptions) => ({
 				messages: [],
@@ -584,6 +586,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				hasHandlers: (eventType: string) => boolean;
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
+				getTurnExecutor: () => undefined;
 				emitInput: (
 					text: string,
 					images: unknown,
@@ -607,6 +610,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				}
 				return undefined;
 			},
+			getTurnExecutor: () => undefined,
 			emitInput: async () => ({ action: "continue" }),
 			emitBeforeAgentStart: async (_prompt, _images, systemPromptOptions) => ({
 				messages: [],

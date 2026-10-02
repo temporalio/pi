@@ -216,6 +216,61 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+### Turn executors
+
+Take over when a turn runs. Pi hands the executor the turn instead of running it, and the executor decides when to call `run()`.
+
+```typescript
+pi.registerTurnExecutor(async (turn) => {
+  console.error(`turn on session ${turn.sessionId}`);
+  await turn.run();
+});
+```
+
+The executor runs in this process against the live session, so the transcript, the events, and the streaming are the same as a turn Pi ran itself. `run()` is the whole turn: the prompt, the model calls, the tools, and the retries and compaction that follow them.
+
+An executor that returns without calling `run()` leaves the turn unrun, prompt included, which is how you hold a turn. Call `ctx.abort()` to stop one that is already running.
+
+One executor wins: the first extension to register one. Register none and Pi runs turns itself, which is the default.
+
+Pass `resumeOnStart` to also be handed a turn an earlier run left unfinished, when the session opens:
+
+```typescript
+pi.registerTurnExecutor(runTurn, { resumeOnStart: true });
+```
+
+A crash during a tool call leaves the session with a tool call and no result, and Pi does not finish it on its own. With `resumeOnStart`, opening the session hands that turn to the executor: the unanswered call is settled as an unknown outcome, and the turn runs on. A session whose transcript ends on an answer is left alone. One that ends on something the model has not answered, such as a custom message or a bash execution added after the last turn, counts as unfinished too, and opening it makes that model call. It is off by default because finishing a turn is a model call the user did not ask for in this session.
+
+This is the hook for putting the loop under something else, such as a scheduler that serialises turns across sessions, or a durable executor that records each turn and re-runs one that a crash interrupted.
+
+For a unit of work smaller than a turn, `turn.steps` drives the same turn a step at a time. A step is a model call, the calls it asks for, and a seal that records their results and says whether the turn is over:
+
+```typescript
+pi.registerTurnExecutor(async (turn) => {
+  await turn.steps.record();
+  for (;;) {
+    const model = await turn.steps.modelCall();
+    const results = [];
+    for (const call of model.ended ? [] : model.toolCalls) {
+      const result = await turn.steps.runToolCall(call.id);
+      if (result) results.push(result);
+    }
+    const { done } = await turn.steps.sealStep(results);
+    if (done) return;
+  }
+});
+```
+
+`record()` puts the turn's messages in the transcript without running them. `modelCall()` reports the calls the model asked for, recorded and not run, so each one can have a retry policy, a timeout or an approval of its own. `runToolCall()` reports a call's result instead of entering it, because a step's results go in together, in the order the model asked for them; `model.sequential` says when they cannot overlap. `sealStep()` records them and answers whether the turn keeps going.
+
+One or the other: a turn that is both run and stepped runs twice. `runToolCall()` returns undefined for a call the transcript already answered, and a `modelCall()` whose response is already recorded reports it again and asks the model nothing, so an executor that lost its own record of a step does not pay for it twice.
+
+Two rules hold for the stepped surface, and a change to it keeps them. A stepped turn's state can be rebuilt from the transcript alone, so no part of it lives only in the memory of the process that took the last step. Every decision to keep the turn going reaches the driver as data in what a call returns, and pi never acts on one the driver cannot see.
+
+A stepped turn ends differently from one `run()` drives in one respect. A step cannot make a request from the context alone, so a `turn_end` continuation keeps a stepped turn going only when the transcript ends on something a step can run, such as a `custom_message` the handler committed. After a settled answer the turn ends. `agent_before_settle` fires when a stepped turn ends and its entries are committed, but its continuation is not honoured. A message queued during the last step is recorded, and the turn goes on to answer it.
+
+Steering is let in later as well. `run()` takes a steering message after whichever step it arrived during. A stepped turn takes a queued message only once its own work is done, so a message steered in mid-turn waits for the step that would otherwise end the turn. Every model call the turn makes before then answers without it.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

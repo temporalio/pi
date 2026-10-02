@@ -10,12 +10,14 @@
 
 import type {
 	AgentMessage,
+	AgentModelCallOutcome,
 	AgentTool,
 	AgentToolCallOutcome,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
 	ToolExecutionMode,
+	TurnToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
 import type {
 	AnyModel,
@@ -1518,6 +1520,81 @@ export interface MarkdownTransformContext {
 
 export type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string;
 
+/**
+ * The turn an executor was handed, one step at a time. Each step is a model call, the calls it
+ * asks for, and a seal that records their results and says whether the turn is over.
+ *
+ * A call's result is reported rather than entered in the transcript, because a step's results go
+ * in together, in the order the model asked for the calls. An executor can therefore settle them
+ * in whatever order they finish. This handle drives the live agent, which admits one call at a
+ * time, so the concurrency is the executor's to arrange, not this handle's to provide.
+ */
+export interface TurnSteps {
+	/** Put the turn's messages in the transcript without running them. */
+	record(): Promise<void>;
+	/**
+	 * True once the turn was interrupted. An abort reaches the unit of work that is running, and
+	 * a driver has more units after it, so it has to stop asking for them itself.
+	 */
+	interrupted(): boolean;
+	modelCall(): Promise<AgentModelCallOutcome>;
+	/** Undefined when the transcript already held a result for the call, so nothing ran. */
+	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
+	sealStep(
+		results: ReadonlyArray<TurnToolCallOutcome>,
+		options?: SealStepOptions,
+	): Promise<{ done: boolean; retryAttempt: number }>;
+}
+
+export interface SealStepOptions {
+	/** The ids of the calls the step being closed asked for. On a durable driver the model call and
+	 * the seal are separate units of work, and this refuses a seal that would close a different one. */
+	expectCalls?: ReadonlyArray<string>;
+	/** The retry count a caller carries between seals, for a session rebuilt per step. */
+	retryAttempt?: number;
+	/** Record the results and stop. What answers for a step that went wrong is a provider retry or a
+	 * compaction, and neither is work to do on a turn the user just stopped. */
+	postRun?: boolean;
+}
+
+/** The turn an executor was handed. */
+export interface TurnExecutorContext {
+	/** The session the turn belongs to, so an executor can key durable state on it. */
+	readonly sessionId: string;
+	/**
+	 * Run the turn to its end, exactly as pi runs it when no executor is registered. An executor
+	 * that only wants to decide when a turn runs calls this and nothing else.
+	 */
+	run(): Promise<void>;
+	/**
+	 * The same turn, driven a step at a time, for an executor that wants a unit of work smaller
+	 * than a turn. One or the other: a turn that is both run and stepped runs twice. Its state is
+	 * rebuilt from the transcript alone, and every decision to keep going comes back as data.
+	 *
+	 * A step cannot make a request from the context alone. A `turn_end` continuation keeps a
+	 * stepped turn going only when the transcript ends on something a step can run, and
+	 * `agent_before_settle` is emitted at the end without its continuation being honoured.
+	 */
+	readonly steps: TurnSteps;
+}
+
+/**
+ * An executor drives either `turn.run()` or `turn.steps`. Returning without either leaves it unrun.
+ */
+export type TurnExecutor = (turn: TurnExecutorContext) => Promise<void>;
+
+export interface TurnExecutorOptions {
+	/**
+	 * Hand the executor a turn that an earlier run left unfinished, when the session opens. Off by
+	 * default, because finishing a turn is a model call the user did not ask for in this session.
+	 */
+	resumeOnStart?: boolean;
+}
+
+export interface RegisteredTurnExecutor extends TurnExecutorOptions {
+	executor: TurnExecutor;
+}
+
 export interface EntryRenderOptions {
 	expanded: boolean;
 }
@@ -1688,6 +1765,16 @@ export interface ExtensionAPI {
 
 	/** Register a transformer for user and assistant Markdown before Pi renders it in the interactive transcript. */
 	registerMarkdownTransformer(transformer: MarkdownTransformer): void;
+
+	/**
+	 * Take over when a turn runs. The executor is handed the turn and decides when to run it,
+	 * which is the seam for putting the loop under a scheduler or a durable executor. It runs in
+	 * this process against the live session, so the transcript and the streaming stay pi's own.
+	 *
+	 * One executor wins: the first extension to register one. Registering none leaves pi running
+	 * turns itself, which is the default.
+	 */
+	registerTurnExecutor(executor: TurnExecutor, options?: TurnExecutorOptions): void;
 
 	/** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
 	registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
@@ -2246,6 +2333,7 @@ export interface Extension {
 	messageRenderers: Map<string, MessageRenderer>;
 	toolRenderers?: ToolRendererResolver[];
 	markdownTransformer?: MarkdownTransformer;
+	turnExecutor?: RegisteredTurnExecutor;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
