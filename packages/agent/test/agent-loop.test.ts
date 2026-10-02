@@ -76,6 +76,43 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 	) as Message[];
 }
 
+const echoSchema = Type.Object({ value: Type.String() });
+
+function createEchoTool(executed: string[] = []): AgentTool<typeof echoSchema, { value: string }> {
+	return {
+		name: "echo",
+		label: "Echo",
+		description: "Echo tool",
+		parameters: echoSchema,
+		async execute(_toolCallId, { value }) {
+			executed.push(value);
+			return { content: [{ type: "text", text: value }], details: { value } };
+		},
+	};
+}
+
+/** The first response asks for two echo calls and stops with `stopReason`; the next one stops. */
+function twoEchoCallsThenStop(stopReason: "toolUse" | "length") {
+	let callIndex = 0;
+	return () => {
+		const stream = new MockAssistantStream();
+		queueMicrotask(() => {
+			const first = callIndex++ === 0;
+			const reason = first ? stopReason : "stop";
+			const content: AssistantMessage["content"] = first
+				? ["a", "b"].map((value, i) => ({
+						type: "toolCall",
+						id: `tool-${i + 1}`,
+						name: "echo",
+						arguments: { value },
+					}))
+				: [{ type: "text", text: "done" }];
+			stream.push({ type: "done", reason, message: createAssistantMessage(content, reason) });
+		});
+		return stream;
+	};
+}
+
 describe("default stream function compatibility", () => {
 	it("uses the configured default when a legacy caller omits streamFn", async () => {
 		let calls = 0;
@@ -523,6 +560,69 @@ describe("agentLoop with AgentMessage", () => {
 		expect(callIndex).toBe(2);
 		const messages = await stream.result();
 		expect(messages[messages.length - 1].role).toBe("assistant");
+	});
+
+	it("fails every call of a length-truncated message even when aborted midway", async () => {
+		const executed: string[] = [];
+		const context: AgentContext = { messages: [], tools: [createEchoTool(executed)] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		const controller = new AbortController();
+
+		const messages = await runAgentLoop(
+			[createUserMessage("echo")],
+			context,
+			config,
+			(event) => {
+				if (event.type === "tool_execution_start") controller.abort();
+			},
+			controller.signal,
+			twoEchoCallsThenStop("length"),
+		);
+
+		expect(executed).toEqual([]);
+		const results = messages.filter((m) => m.role === "toolResult");
+		expect(results.map((m) => m.toolCallId)).toEqual(["tool-1", "tool-2"]);
+		for (const result of results) {
+			const text = result.content[0];
+			expect(text?.type === "text" ? text.text : "").toContain("output token limit");
+		}
+	});
+
+	it("emits a sequential batch's result messages at the seal, after every call ends", async () => {
+		const context: AgentContext = { messages: [], tools: [createEchoTool()] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+		};
+
+		const sequence: string[] = [];
+		await runAgentLoop(
+			[createUserMessage("echo")],
+			context,
+			config,
+			(event) => {
+				if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+					sequence.push(`${event.type}:${event.toolCallId}`);
+				} else if (event.type === "message_end" && event.message.role === "toolResult") {
+					sequence.push(`result:${event.message.toolCallId}`);
+				} else if (event.type === "turn_end") {
+					sequence.push("turn_end");
+				}
+			},
+			undefined,
+			twoEchoCallsThenStop("toolUse"),
+		);
+
+		expect(sequence.slice(0, 7)).toEqual([
+			"tool_execution_start:tool-1",
+			"tool_execution_end:tool-1",
+			"tool_execution_start:tool-2",
+			"tool_execution_end:tool-2",
+			"result:tool-1",
+			"result:tool-2",
+			"turn_end",
+		]);
 	});
 
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
