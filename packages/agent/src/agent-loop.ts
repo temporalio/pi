@@ -353,6 +353,10 @@ async function runTurnToolCall(params: TurnToolCallParams): Promise<TurnToolCall
 /**
  * Close a step whose calls have settled: record their results, then decide whether the turn
  * keeps going. A step that ran no tools seals the same way.
+ *
+ * Results reach the transcript here, together and in the model's order, not as each call
+ * ends. A run that dies part way through a batch therefore loses results that had settled,
+ * and a resumed turn reports those calls as unknown outcomes rather than their results.
  */
 async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutcome> {
 	const { newMessages, signal, emit, message } = params;
