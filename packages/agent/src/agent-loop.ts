@@ -755,8 +755,9 @@ async function dispatchToolCallsSequential(
 			await runTurnToolCall({ context: currentContext, assistantMessage, toolCall, config, signal, emit }),
 		);
 		// An abort leaves the rest of the batch unsettled on purpose: the calls are still in the
-		// transcript, and settling them here would answer for tools that never ran.
-		if (signal?.aborted) {
+		// transcript, and settling them here would answer for tools that never ran. A truncated
+		// response runs no tool, so each of its calls gets its failure regardless.
+		if (signal?.aborted && assistantMessage.stopReason !== "length") {
 			break;
 		}
 	}
