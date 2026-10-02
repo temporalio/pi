@@ -996,6 +996,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private _writeGuard?: () => void;
 
 	private constructor(
 		cwd: string,
@@ -1189,10 +1190,27 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this._writeGuard?.();
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+	}
+
+	/**
+	 * Asked immediately before every entry is written, and expected to throw when this process is
+	 * no longer entitled to write. It runs before the in-memory leaf moves, so a rejected append
+	 * leaves the session as it was. For a driver that owns the session file from outside: two
+	 * writers do not corrupt the file, they branch it, and the only point that is always right
+	 * before a write is here. Synchronous because the whole append path is.
+	 *
+	 * A refusal during a run ends the run, and the call that drove it rejects with the guard's
+	 * error once the session has settled. Memory can then hold messages the file does not, the
+	 * refused one and the failure recorded for it among them, so abandon the session once the
+	 * guard fires and open the file again.
+	 */
+	setWriteGuard(guard: (() => void) | undefined): void {
+		this._writeGuard = guard;
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
