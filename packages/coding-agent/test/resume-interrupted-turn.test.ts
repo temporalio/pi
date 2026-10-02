@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage, type TurnToolCallOutcome } from "@earendil-works/pi-agent-core";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	type AssistantMessage,
@@ -115,6 +115,25 @@ function assertValidToolPairing(messages: AgentMessage[]): void {
 		const ids = calls.filter((b) => b.type === "toolCall").map((b) => b.id);
 		expect(ids).toContain(message.toolCallId);
 	}
+}
+
+/** One model call, its tool calls, and the seal, the way a driver takes a step. */
+async function driveStep(target: AgentSession): Promise<{ done: boolean }> {
+	const model = await target.modelCall();
+	const results: TurnToolCallOutcome[] = [];
+	for (const toolCall of model.ended ? [] : model.toolCalls) {
+		const result = await target.runToolCall(toolCall.id);
+		if (result) results.push(result);
+	}
+	return target.sealStep(results);
+}
+
+/** Steps until the turn is over. */
+async function drive(target: AgentSession): Promise<void> {
+	for (let step = 0; step < 8; step++) {
+		if ((await driveStep(target)).done) return;
+	}
+	throw new Error("The turn did not end");
 }
 
 describe("AgentSession: settling an interrupted turn", () => {
@@ -380,6 +399,175 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(await session.recordPrompt("next")).toBe(true);
 		assertValidToolPairing(session.agent.state.messages);
 	});
+	it("settles the calls of an interrupted turn and drives it to completion", async () => {
+		await createSession();
+		seed([user("do two things"), assistant([call("hang-1"), call("hang-2")], "toolUse")]);
+
+		expect(session.prepareStep()).toBe(true);
+		await drive(session);
+		expect(session.isIdle).toBe(true);
+
+		const messages = session.agent.state.messages;
+
+		// The prompt was not added again.
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+
+		// Both calls are settled, and the turn produced a final answer.
+		const settled = messages.filter((m) => m.role === "toolResult") as ToolResultMessage[];
+		expect(settled.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+		expect(settled.every((m) => m.isError)).toBe(true);
+		expect(findDanglingToolCalls(messages)).toEqual([]);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "all handled" });
+
+		// The settled results reached the session file, not just memory.
+		const written = persisted().filter((m) => m.role === "toolResult") as ToolResultMessage[];
+		expect(written.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+
+		// The repaired transcript is a payload a provider accepts.
+		assertValidToolPairing(messages);
+	});
+
+	it("keeps a result that landed before the interruption", async () => {
+		await createSession();
+		seed([
+			user("do two things"),
+			assistant([call("done-1"), call("hang-1")], "toolUse"),
+			toolResult("done-1", "did done-1", false),
+		]);
+
+		expect(session.prepareStep()).toBe(true);
+		await drive(session);
+
+		const messages = session.agent.state.messages;
+		const kept = messages.find((m) => m.role === "toolResult" && m.toolCallId === "done-1") as ToolResultMessage;
+		expect(kept.isError).toBe(false);
+		expect(kept.content?.[0]).toMatchObject({ type: "text", text: "did done-1" });
+
+		// The turn finished, and the payload stays valid for the provider.
+		expect(messages[messages.length - 1].role).toBe("assistant");
+		assertValidToolPairing(messages);
+	});
+
+	it("resumes after an aborted assistant message", async () => {
+		await createSession();
+		seed([user("go"), assistant([{ type: "text", text: "" }], "aborted")]);
+
+		expect(session.prepareStep()).toBe(true);
+		await drive(session);
+
+		const messages = session.agent.state.messages;
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.stopReason).toBe("stop");
+	});
+
+	it("records a prompt without calling the model, and a step runs it", async () => {
+		await createSession([answer("answer")]);
+
+		expect(await session.recordPrompt("go")).toBe(true);
+		expect(modelCalls).toBe(0);
+		expect(session.agent.state.messages.filter((m) => m.role !== "system").map((m) => m.role)).toEqual(["user"]);
+
+		expect((await driveStep(session)).done).toBe(true);
+		expect(modelCalls).toBe(1);
+
+		const messages = session.agent.state.messages;
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+		const last = messages[messages.length - 1];
+		expect(last.role === "assistant" && last.content[0]).toMatchObject({ type: "text", text: "answer" });
+
+		// The turn is on disk, so the next step can run in another process.
+		// The same entries prompt() writes, the loadout's system message included.
+		expect(persisted().map((m) => m.role)).toEqual(["system", "user", "assistant"]);
+	});
+
+	it("settles an interrupted turn without calling the model, then steps", async () => {
+		await createSession();
+		seed([user("go"), assistant([call("hang-1")], "toolUse")]);
+
+		expect(session.prepareStep()).toBe(true);
+		expect(modelCalls).toBe(0);
+
+		const settled = session.agent.state.messages.filter((m) => m.role === "toolResult") as ToolResultMessage[];
+		expect(settled.map((m) => m.toolCallId)).toEqual(["hang-1"]);
+		expect(settled[0].isError).toBe(true);
+		expect(persisted().filter((m) => m.role === "toolResult").length).toBe(1);
+
+		expect((await driveStep(session)).done).toBe(true);
+		expect(modelCalls).toBe(1);
+		expect(session.agent.state.messages.filter((m) => m.role === "user").length).toBe(1);
+		assertValidToolPairing(session.agent.state.messages);
+	});
+
+	it("keeps retry handling, so a transient provider error asks for another step", async () => {
+		const failed = assistant([{ type: "text", text: "" }], "error");
+		failed.errorMessage = "overloaded";
+		await createSession([failed, answer("answer")]);
+		session.agent.state.messages = [user("go")];
+
+		// Post-run handling owns the retry, so the step must not report itself finished.
+		expect((await driveStep(session)).done).toBe(false);
+	});
+	it("leaves calls a custom message closed to the provider, and steps from it", async () => {
+		await createSession();
+		seed([user("go"), assistant([call("hang-1")], "toolUse")]);
+		session.agent.state.messages = [...session.agent.state.messages, note("look at this")];
+
+		// The provider reads the custom message as a user turn, which already answers the call.
+		// A result recorded after it would pair with nothing.
+		expect(session.prepareStep()).toBe(true);
+		expect(session.agent.state.messages.filter((m) => m.role === "toolResult")).toEqual([]);
+
+		expect((await driveStep(session)).done).toBe(true);
+		expect(modelCalls).toBe(1);
+		assertValidToolPairing(session.agent.state.messages);
+	});
+
+	it("resumes a turn that ends on a custom message", async () => {
+		await createSession();
+		seed([user("hi"), answer("done")]);
+		session.agent.state.messages = [...session.agent.state.messages, note("one more thing")];
+
+		expect(session.prepareStep()).toBe(true);
+		await drive(session);
+		expect(modelCalls).toBe(1);
+		expect(session.agent.state.messages.at(-1)?.role).toBe("assistant");
+	});
+
+	it("says it is busy while a step is open", async () => {
+		let release = () => {};
+		await createSession(
+			[answer("answer")],
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+		);
+		session.agent.state.messages = [user("go")];
+
+		const running = driveStep(session);
+		// Data a driver can act on: "try again", not "the turn already has its answer".
+		expect(session.prepareStep()).toBe("busy");
+
+		release();
+		expect((await running).done).toBe(true);
+		expect(modelCalls).toBe(1);
+	});
+
+	it("leaves a refused step's turn as it was, prompt options included", async () => {
+		await createSession();
+		const failed = assistant([{ type: "text", text: "" }], "error");
+		seed([user("go"), failed]);
+		const options = { cwd: tempDir };
+		const internals = session as unknown as { _runSystemPromptOptions: unknown };
+		internals._runSystemPromptOptions = options;
+
+		await expect(session.modelCall()).rejects.toThrow("Cannot step from message role: assistant");
+
+		expect(session.isIdle).toBe(true);
+		expect(internals._runSystemPromptOptions).toBe(options);
+		expect(modelCalls).toBe(0);
+	});
 });
 
 describe("AgentSession: recording a prompt", () => {
@@ -450,6 +638,29 @@ describe("AgentSession: recording a prompt", () => {
 
 			const roles = harness.session.agent.state.messages.map((message) => message.role);
 			expect(roles.slice(-2)).toEqual(["user", "custom"]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+	it("refuses a prompt when a run started while it was being built", async () => {
+		const ref: { session?: AgentSession; stepping?: Promise<unknown> } = {};
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("before_agent_start", () => {
+				ref.stepping ??= ref.session?.modelCall();
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			ref.session = harness.session;
+			harness.setResponses([fauxAssistantMessage("first answer")]);
+			harness.session.agent.state.messages = [user("first")];
+
+			const recording = harness.session.recordPrompt("second");
+			await expect(recording).rejects.toThrow("Agent is already processing");
+
+			await ref.stepping;
+			expect((await harness.session.sealStep([])).done).toBe(true);
+			expect(getUserTexts(harness)).toEqual(["first"]);
 		} finally {
 			harness.cleanup();
 		}

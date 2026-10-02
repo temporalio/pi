@@ -1,7 +1,10 @@
 // Core session management
 
+// What AgentSession's stepped calls hand back. Re-exported so a caller driving a turn from
+// outside needs one package, the way every other type it touches does.
+export type { AgentModelCallOutcome, TurnToolCallOutcome } from "@earendil-works/pi-agent-core";
 // Re-exported so a caller settling an interrupted turn from outside needs one package.
-export { type TurnToolCallOutcome, unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
+export { unknownToolCallOutcome } from "@earendil-works/pi-agent-core";
 export { type Args, parseArgs } from "./cli/args.ts";
 // Config paths
 export {
@@ -147,6 +150,7 @@ export type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SealStepOptions,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -185,7 +189,11 @@ export type {
 	ToolResultEventResult,
 	TurnEndEvent,
 	TurnEndEventResult,
+	TurnExecutor,
+	TurnExecutorContext,
+	TurnExecutorOptions,
 	TurnStartEvent,
+	TurnSteps,
 	UIPromptEndEvent,
 	UIPromptKind,
 	UIPromptStartEvent,
