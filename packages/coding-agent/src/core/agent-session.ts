@@ -27,9 +27,11 @@ import {
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	declareToolChanges,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
+	unknownToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -125,7 +127,9 @@ import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type ContextEditEntry,
+	findDanglingToolCalls,
 	getLatestCompactionEntry,
+	isOutsideToolPairing,
 	type SessionEntry,
 	SessionManager,
 	type SessionProjection,
@@ -370,6 +374,9 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	}
 	return tokens;
 }
+
+const UNSETTLED_CALLS_MESSAGE = "Tool calls have no result. Call prepareStep() first.";
+const BUILD_BUSY_MESSAGE = "Agent is already processing. Wait for completion before prompting.";
 
 // ============================================================================
 // AgentSession Class
@@ -1142,27 +1149,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
-			let entryId: string | undefined;
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				entryId = this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "system" ||
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				entryId = this.sessionManager.appendMessage(event.message);
-			}
-			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._persistMessage(event.message);
 
 			if (event.message.role === "assistant") {
 				const assistantMsg = event.message as AssistantMessage;
@@ -1820,16 +1807,15 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._agentRunAbortRequested = false;
-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
-		this._failedResponse = undefined;
-		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
+		await this._drive(() => this.agent.prompt(messages));
+	}
+
+	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
+	private async _drive(initial: () => Promise<void>): Promise<void> {
+		this._beginTurn();
 		this._isAgentRunActive = true;
 		try {
-			await this.agent.prompt(messages);
+			await initial();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
 					if (this._agentRunAbortRequested) break;
@@ -1843,11 +1829,129 @@ export class AgentSession {
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
-			this._runSystemPromptOptions = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			await this._settleRun();
 		}
+	}
+
+	/** What a turn starts with, before anything of it reaches the transcript. */
+	private _beginTurn(): void {
+		this._agentRunAbortRequested = false;
+		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		// The run records the loadout in the transcript; restored tools that did not register by now
+		// are dropped, so a tool that never registers does not stay pending.
+		this._pendingToolNames.clear();
+	}
+
+	/** What every run ends with. */
+	private async _settleRun(): Promise<void> {
+		this._runSystemPromptOptions = undefined;
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		await this._emitAgentSettled();
+	}
+
+	/**
+	 * Settle what a stopped turn left behind, without calling the model: tool calls with no
+	 * result get one, and a trailing assistant message that holds no answer is dropped.
+	 * Returns whether the turn still has work, so false means it already has its answer. A
+	 * transcript that ends on anything the model has not answered has work, a custom message
+	 * or a bash execution included. Returns `"busy"` while a run is active, having looked at
+	 * nothing, because neither answer is known then.
+	 *
+	 * A driver calls this before its next model call, so recovery is a step like any other.
+	 */
+	prepareStep(): boolean | "busy" {
+		if (this._isAgentRunActive) {
+			return "busy";
+		}
+
+		const messages = this.agent.state.messages;
+		const dangling = findDanglingToolCalls(messages);
+		if (dangling.length > 0) {
+			const settled = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
+			this._recordMessages(settled);
+			return true;
+		}
+
+		// The provider pairs results with calls past these, so they do not decide what comes next.
+		const last = messages.findLast((message) => !isOutsideToolPairing(message));
+		if (!last) {
+			return false;
+		}
+		// Every other role reaches the provider as a user turn or a result, which a model call
+		// answers.
+		if (last.role !== "assistant") {
+			return true;
+		}
+
+		// An errored or aborted assistant message holds no answer, and the provider
+		// never sees it. Drop it so the transcript ends where the model can pick up.
+		if (last.stopReason === "error" || last.stopReason === "aborted") {
+			// Memory is rebuilt from the session file, so a written message is omitted there too,
+			// or the next rebuild brings it back.
+			if (this._findPersistedMessageEntryId(last)) {
+				this._omitRecoveryAttempt(last);
+			} else {
+				this.agent.state.messages = messages.filter((message) => message !== last);
+			}
+			return this.prepareStep();
+		}
+
+		return false;
+	}
+
+	/**
+	 * Put messages in the transcript without running anything. The durable record comes
+	 * first, and memory follows one message at a time: if a write throws, memory must hold
+	 * exactly what the file does, or the next resume writes a message a second time.
+	 *
+	 * No extension sees these, because the `message_end` they get can replace a message and
+	 * this has to stay synchronous for prepareStep(). See _recordMessagesThroughExtensions().
+	 */
+	private _recordMessages(messages: AgentMessage[]): void {
+		for (const message of messages) {
+			this._persistMessage(message);
+			this.agent.state.messages = [...this.agent.state.messages, message];
+			this._emit({ type: "message_start", message });
+			this._emit({ type: "message_end", message });
+		}
+	}
+
+	/**
+	 * Record messages a turn takes in, offering each to the extensions' message events first
+	 * the way the loop does when it adds them. A `message_end` handler can replace the message,
+	 * so what is recorded is what the handlers leave.
+	 */
+	private async _recordMessagesThroughExtensions(messages: AgentMessage[]): Promise<void> {
+		for (const message of messages) {
+			await this._emitExtensionEvent({ type: "message_start", message });
+			await this._emitExtensionEvent({ type: "message_end", message });
+			this._recordMessages([message]);
+		}
+	}
+
+	/** Write one message to the session file, in the entry shape its role belongs in. */
+	private _persistMessage(message: AgentMessage): void {
+		let entryId: string | undefined;
+		if (message.role === "custom") {
+			entryId = this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} else if (
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "toolResult"
+		) {
+			entryId = this.sessionManager.appendMessage(message);
+		}
+		if (entryId) this._entryIdsByMessage.set(message, entryId);
+		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1970,6 +2074,61 @@ export class AgentSession {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return;
+		}
+
+		options?.preflightResult?.("started");
+		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Record a prompt without running it. Everything prompt() does to build the turn
+	 * happens here (extension input, template expansion, the model and auth checks); the
+	 * model call does not. Whatever drives the turn next picks it up from the transcript.
+	 *
+	 * For a caller that drives a turn one step at a time and checkpoints in between.
+	 * Returns whether a prompt was recorded: an extension command handles its own text,
+	 * and a prompt sent mid-stream is queued instead. Throws while a tool call of the
+	 * last step has no result, because the prompt would land between the two; prepareStep()
+	 * settles them.
+	 */
+	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
+		if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
+			throw new Error(UNSETTLED_CALLS_MESSAGE);
+		}
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return false;
+		}
+
+		options?.preflightResult?.("started");
+		this._beginTurn();
+		// Recording awaits the extensions' message handlers. Busy until the prompt is in, or a step
+		// that started in between would answer part of it.
+		this._isAgentRunActive = true;
+		try {
+			// The loop declares a prompt's loadout as it adds the prompt; a recorded one never
+			// reaches it.
+			const { messages: transcript, tools } = this.agent.state;
+			const declared = declareToolChanges({ messages: transcript, tools }, messages);
+			await this._recordMessagesThroughExtensions(declared);
+		} finally {
+			this._isAgentRunActive = false;
+			// Queued while busy, these belong before the step that answers the prompt.
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			this._resolveIdleWaitIfIdle();
+		}
+		return true;
+	}
+
+	/**
+	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
+	 * when the text needed no run at all.
+	 */
+	private async _buildPromptMessages(text: string, options?: PromptOptions): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -2073,6 +2232,11 @@ export class AgentSession {
 		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
 		const normalized = await this._normalizePromptImages(currentImages);
+		// The last await. A run that started during any of them owns the tool loadout and the prompt
+		// options this would now replace.
+		if (this._isAgentRunActive) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
@@ -2106,8 +2270,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**
