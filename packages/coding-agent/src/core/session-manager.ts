@@ -1243,10 +1243,21 @@ export class SessionManager {
 
 	private _appendEntry(entry: SessionEntry): void {
 		this._writeGuard?.();
+		// _persist of a first write reads fileEntries, so the entry goes in before it. A failed
+		// write then has to take the entry back out, or memory holds an entry the file does not,
+		// and a caller's retry parents new entries to it or appends it a second time.
+		const leafBefore = this.leafId;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			this.leafId = leafBefore;
+			throw error;
+		}
 	}
 
 	/**
