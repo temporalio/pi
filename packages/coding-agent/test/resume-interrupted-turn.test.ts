@@ -380,6 +380,81 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(await session.recordPrompt("next")).toBe(true);
 		assertValidToolPairing(session.agent.state.messages);
 	});
+
+	it("queues a recording sent mid-run instead of rejecting it", async () => {
+		let release = () => {};
+		await createSession(
+			[answer("first"), answer("second")],
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+		);
+
+		const running = session.prompt("go");
+		await vi.waitFor(() => expect(session.isStreaming).toBe(true));
+		// The run owns the transcript: the recording queues behind it, as prompt() would.
+		await expect(session.recordPrompt("new direction", { streamingBehavior: "followUp" })).resolves.toBe(false);
+		expect(session.prepareStep()).toBe("busy");
+
+		release();
+		await running;
+		const texts = session.agent.state.messages
+			.filter((m) => m.role === "user")
+			.map((m) => contentText(m.content, ""));
+		expect(texts).toContain("new direction");
+	});
+
+	it("tells the loser of two concurrent starts that the session is taken", async () => {
+		let release = () => {};
+		await createSession(
+			[answer("answer")],
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+		);
+
+		// Both builders pass their awaits before either caller claims the run.
+		const record = session.recordPrompt("checkpoint");
+		const run = session.prompt("go");
+		release();
+		const results = await Promise.allSettled([record, run]);
+
+		const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+		expect(rejected.length).toBe(1);
+		expect(String(rejected[0].reason)).toContain("already processing");
+
+		// Exactly one of the two reached the transcript.
+		const texts = session.agent.state.messages
+			.filter((m) => m.role === "user")
+			.map((m) => contentText(m.content, ""));
+		expect(texts.includes("checkpoint") !== texts.includes("go")).toBe(true);
+	});
+
+	it("settles once when a subscriber calls back in from message_end", async () => {
+		await createSession();
+		seed([user("go"), assistant([call("hang-1"), call("hang-2")], "toolUse")]);
+
+		const nested: (boolean | "busy")[] = [];
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "message_end") nested.push(session.prepareStep());
+		});
+		expect(session.prepareStep()).toBe(true);
+		unsubscribe();
+
+		expect(nested).toContain("busy");
+		const results = session.agent.state.messages.filter((m) => m.role === "toolResult");
+		expect(results.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+		assertValidToolPairing(session.agent.state.messages);
+	});
+
+	it("is busy while compaction runs", async () => {
+		await createSession();
+		const open = session as unknown as { _compactionAbortController?: AbortController };
+		open._compactionAbortController = new AbortController();
+		expect(session.prepareStep()).toBe("busy");
+		open._compactionAbortController = undefined;
+		expect(session.prepareStep()).toBe(false);
+	});
 });
 
 describe("AgentSession: recording a prompt", () => {

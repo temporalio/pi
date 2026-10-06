@@ -393,6 +393,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _settlingStep = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1858,15 +1859,27 @@ export class AgentSession {
 	 * Returns whether the turn still has work, so false means it already has its answer. A
 	 * transcript that ends on anything the model has not answered has work, a custom message
 	 * or a bash execution included. Returns `"busy"` while a run is active, having looked at
-	 * nothing, because neither answer is known then.
+	 * nothing, because neither answer is known then. Mind that `"busy"` is truthy: a caller
+	 * that treats the result as a boolean reads busy as has-work.
 	 *
 	 * A driver calls this before its next model call, so recovery is a step like any other.
 	 */
 	prepareStep(): boolean | "busy" {
-		if (this._isAgentRunActive) {
+		// Compaction writes the transcript the way a run does. And a message_end subscriber that
+		// calls back in mid-settle would settle calls this invocation already snapshotted, so the
+		// transcript ends up holding a result twice.
+		if (this._isAgentRunActive || this.isCompacting || this._settlingStep) {
 			return "busy";
 		}
+		this._settlingStep = true;
+		try {
+			return this._settleStoppedTurn();
+		} finally {
+			this._settlingStep = false;
+		}
+	}
 
+	private _settleStoppedTurn(): boolean {
 		const messages = this.agent.state.messages;
 		const dangling = findDanglingToolCalls(messages);
 		if (dangling.length > 0) {
@@ -1896,7 +1909,7 @@ export class AgentSession {
 			} else {
 				this.agent.state.messages = messages.filter((message) => message !== last);
 			}
-			return this.prepareStep();
+			return this._settleStoppedTurn();
 		}
 
 		return false;
@@ -2079,6 +2092,12 @@ export class AgentSession {
 			return;
 		}
 
+		// Same race as in recordPrompt(): the builder awaited, so a recording or another prompt can
+		// hold the session by now. _drive() claims it synchronously from here, so one check closes
+		// the window.
+		if (this._isAgentRunActive) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
 		options?.preflightResult?.("started");
 		await this._runAgentPrompt(messages);
 	}
@@ -2090,17 +2109,34 @@ export class AgentSession {
 	 *
 	 * For a caller that drives a turn one step at a time and checkpoints in between.
 	 * Returns whether a prompt was recorded: an extension command handles its own text,
-	 * and a prompt sent mid-stream is queued instead. Throws while a tool call of the
-	 * last step has no result, because the prompt would land between the two; prepareStep()
-	 * settles them.
+	 * and a prompt sent mid-stream is queued instead. The options' preflightResult tells
+	 * those apart: a queued prompt runs later, model call included, in whatever turn picks
+	 * it up. Throws while a tool call of the last stopped step has no result, because the
+	 * prompt would land between the two; prepareStep() settles them.
+	 *
+	 * Two exceptions to "no model call". Compaction can run here, the way it does before a
+	 * prompt, and compaction asks the model once. And abort() does not reach a recording:
+	 * the session stays busy until the extensions' message handlers return. The recording
+	 * itself is not idempotent either. A retry whose first attempt finished but never
+	 * reported records the text a second time, so a driver that retries carries its own
+	 * mark in the text and checks the transcript tail for it.
 	 */
 	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
-		if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
-			throw new Error(UNSETTLED_CALLS_MESSAGE);
-		}
 		const messages = await this._buildPromptMessages(text, options);
 		if (!messages) {
 			return false;
+		}
+
+		// The builder awaited, so the claim must be taken in the same synchronous block as this
+		// check, or two callers both pass before either claims. A run that started meanwhile owns
+		// the transcript, and recording into it would land the prompt inside someone else's step.
+		if (this._isAgentRunActive) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
+		// Checked only on a stopped transcript, after commands and queueing had their chance: a
+		// live run's in-flight call is not a dangling one, and an extension command never appends.
+		if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
+			throw new Error(UNSETTLED_CALLS_MESSAGE);
 		}
 
 		options?.preflightResult?.("started");
