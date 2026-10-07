@@ -9,6 +9,7 @@ import {
 	contentText,
 	EventStream,
 	fauxAssistantMessage,
+	getCurrentSystemPrompt,
 	getModel,
 	type ToolResultMessage,
 	type UserMessage,
@@ -414,6 +415,30 @@ describe("AgentSession: settling an interrupted turn", () => {
 			.filter((m) => m.role === "user")
 			.map((m) => contentText(m.content, ""));
 		expect(texts).toContain("new direction");
+	});
+
+	it("runs the winner of two concurrent prompts with its own system prompt", async () => {
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("before_agent_start", (event) => ({ systemPrompt: `for ${event.prompt}` }));
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			const seen: string[] = [];
+			harness.setResponses([
+				(context) => {
+					seen.push(getCurrentSystemPrompt(context.messages) ?? "");
+					return fauxAssistantMessage("answer");
+				},
+			]);
+
+			// The loser's build must not put its prompt options under the winner's turn.
+			const results = await Promise.allSettled([harness.session.prompt("one"), harness.session.prompt("two")]);
+			expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+			const winner = results[0].status === "fulfilled" ? "one" : "two";
+			expect(seen).toEqual([`for ${winner}`]);
+		} finally {
+			harness.cleanup();
+		}
 	});
 
 	it("tells the loser of two concurrent starts that the session is taken", async () => {
