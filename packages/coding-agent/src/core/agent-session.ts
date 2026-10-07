@@ -2290,6 +2290,8 @@ export class AgentSession {
 		// One build at a time from here. What follows changes shared state (the queues, the tool
 		// loadout, the prompt options), and extension hooks run between those changes. A second
 		// build is refused before it changes anything, so its hooks cannot touch this one's loadout.
+		// Input handlers stay outside on purpose. They also run for a prompt queued during a live
+		// turn, so they are never kept apart from a turn, and one may handle the text itself.
 		if (this._buildingPrompt) {
 			throw new Error(BUILD_BUSY_MESSAGE);
 		}
@@ -2657,12 +2659,12 @@ export class AgentSession {
 	 * Called once the current turn's tool results are in agent state and session history.
 	 */
 	private _flushPendingCustomMessages(): void {
-		if (this._pendingCustomMessages.length === 0) return;
-
-		const pending = this._pendingCustomMessages;
-		this._pendingCustomMessages = [];
-		for (const appMessage of pending) {
-			this._appendCustomMessage(appMessage);
+		// Each message leaves the queue once it is written, so a write that fails keeps it and the
+		// rest for the next flush, and nothing goes in twice. What a subscriber queues while this
+		// runs waits for the next flush.
+		for (let count = this._pendingCustomMessages.length; count > 0; count--) {
+			this._appendCustomMessage(this._pendingCustomMessages[0]);
+			this._pendingCustomMessages.shift();
 		}
 	}
 
@@ -4237,11 +4239,15 @@ export class AgentSession {
 	private _flushPendingBashMessages(): void {
 		if (this._pendingBashMessages.length === 0) return;
 
-		for (const bashMessage of this._pendingBashMessages) {
-			this.sessionManager.appendMessage(bashMessage);
+		// The same rule as for custom messages. Only what was written leaves the queue.
+		try {
+			while (this._pendingBashMessages.length > 0) {
+				this.sessionManager.appendMessage(this._pendingBashMessages[0]);
+				this._pendingBashMessages.shift();
+			}
+		} finally {
+			this._refreshFinalizedContext();
 		}
-		this._pendingBashMessages = [];
-		this._refreshFinalizedContext();
 	}
 
 	// =========================================================================
