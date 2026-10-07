@@ -457,6 +457,54 @@ describe("AgentSession: settling an interrupted turn", () => {
 		assertValidToolPairing(session.agent.state.messages);
 	});
 
+	it("queues a turn a subscriber starts while a stopped turn settles", async () => {
+		await createSession();
+		seed([user("go"), assistant([call("hang-1"), call("hang-2")], "toolUse")]);
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
+			if (event.message.toolCallId !== "hang-1") return;
+			void session.sendCustomMessage(
+				{ customType: "nudge", content: "go on", display: false },
+				{ triggerTurn: true },
+			);
+		});
+		expect(session.prepareStep()).toBe(true);
+		unsubscribe();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// No turn started from the part settled when the first result was announced.
+		expect(modelCalls).toBe(0);
+		const results = session.agent.state.messages.filter((m) => m.role === "toolResult");
+		expect(results.map((m) => m.toolCallId)).toEqual(["hang-1", "hang-2"]);
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+	});
+
+	it("queues a turn a subscriber starts while a recording flushes what it queued", async () => {
+		await createSession([answer("answer")]);
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type !== "message_end") return;
+			const message = event.message;
+			if (message.role === "user") {
+				// Held for the end of the busy window, then flushed.
+				void session.sendCustomMessage(
+					{ customType: "note", content: "first", display: false },
+					{ triggerTurn: false },
+				);
+			} else if (message.role === "custom" && message.customType === "note") {
+				void session.sendCustomMessage(
+					{ customType: "nudge", content: "go on", display: false },
+					{ triggerTurn: true },
+				);
+			}
+		});
+		expect(await session.recordPrompt("go")).toBe(true);
+		unsubscribe();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(modelCalls).toBe(0);
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+	});
+
 	it("is busy while compaction runs", async () => {
 		await createSession();
 		const open = session as unknown as { _compactionAbortController?: AbortController };

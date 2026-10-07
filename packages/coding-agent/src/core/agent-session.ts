@@ -377,7 +377,6 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
-	private _settlingStep = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1818,17 +1817,34 @@ export class AgentSession {
 	 * A driver calls this before its next model call, so recovery is a step like any other.
 	 */
 	prepareStep(): boolean | "busy" {
-		// Compaction writes the transcript the way a run does. And a message_end subscriber that
-		// calls back in mid-settle would settle calls this invocation already snapshotted, so the
-		// transcript ends up holding a result twice.
-		if (this._isAgentRunActive || this.isCompacting || this._settlingStep) {
+		// Compaction writes the transcript the way a run does.
+		if (this._isAgentRunActive || this.isCompacting) {
 			return "busy";
 		}
-		this._settlingStep = true;
+		// Busy while it settles, the same as a run. A subscriber that reacts to a settled result
+		// would otherwise see a transcript that is only part settled. Calling back in here would
+		// settle the calls again, and a turn it starts would answer the part it saw. While busy,
+		// both are refused or queued, as they are during a run.
+		this._isAgentRunActive = true;
 		try {
 			return this._settleStoppedTurn();
 		} finally {
-			this._settlingStep = false;
+			this._releaseRun();
+		}
+	}
+
+	/**
+	 * End a busy window that is not a run, such as a settle or a recording. Messages queued while
+	 * busy go in first, still busy, so a subscriber reacting to one queues behind the rest
+	 * instead of starting a turn between them.
+	 */
+	private _releaseRun(): void {
+		try {
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+		} finally {
+			this._isAgentRunActive = false;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -2111,11 +2127,8 @@ export class AgentSession {
 			const declared = declareToolChanges({ messages: transcript, tools }, messages);
 			await this._recordMessagesThroughExtensions(declared);
 		} finally {
-			this._isAgentRunActive = false;
 			// Queued while busy, these belong before the step that answers the prompt.
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			this._resolveIdleWaitIfIdle();
+			this._releaseRun();
 		}
 		return true;
 	}
