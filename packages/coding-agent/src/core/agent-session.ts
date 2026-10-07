@@ -984,6 +984,9 @@ export class AgentSession {
 			const extensionContinue = dispatched
 				? dispatched.continue
 				: await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
+			// A finishTurn the app installed on the agent runs on every seal attempt, a replay
+			// included, so it must be safe to run again. Durable effects belong in turn_end, whose
+			// decision is recorded once.
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			this._turnContinueRequested = false;
 			if (previousDecision?.action === "end") return previousDecision;
@@ -2290,6 +2293,11 @@ export class AgentSession {
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 		options: SealStepOptions = {},
 	): Promise<SealStepResult> {
+		// A tool call of this step is still running. Refused before the seal takes the session, or
+		// its settle would free the session under the running call.
+		if (this.agent.state.isStreaming) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
 		// Busy until the seal settles, also when this process did not open the step, so a prompt
 		// sent while turn_end handlers run queues instead of being refused.
 		this._isAgentRunActive = true;
@@ -2344,9 +2352,19 @@ export class AgentSession {
 	 * is not there to seal again. The file still holds the response, which says what was decided.
 	 */
 	private _replayRecoverySeal(options: SealStepOptions): SealStepResult | undefined {
-		const omitted = this._findOmittedStepResponse();
-		if (!omitted) return undefined;
+		const found = this._findOmittedStepResponse();
+		if (!found) return undefined;
 		const carried = options.retryAttempt ?? 0;
+		if (!found.recovery) {
+			// A turn_end handler took the response out, not a recovery. The seal that ran recorded
+			// what turn_end decided, and that decides the replay too.
+			return {
+				done: !found.dispatch?.continue,
+				retryAttempt: carried,
+				overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
+			};
+		}
+		const omitted = found.message;
 		const retried = this._isRetryableError(omitted);
 		return {
 			done: false,
@@ -2357,22 +2375,43 @@ export class AgentSession {
 	}
 
 	/**
-	 * The step's response, when a recovery took it out of the model's context and nothing came
+	 * The step's response, when something took it out of the model's context and nothing came
 	 * after it. Only the entries after the last message the model still sees are read, so a
 	 * response the model answered again is not found.
+	 *
+	 * A recovery omits the response after the seal's turn_end marker, and a turn_end handler's
+	 * edit goes in before it, in the same write. So the order in the file says which one it was.
 	 */
-	private _findOmittedStepResponse(): AssistantMessage | undefined {
+	private _findOmittedStepResponse():
+		| { message: AssistantMessage; recovery: boolean; dispatch?: TurnEndDispatch }
+		| undefined {
 		const omitted = new Set<string>();
+		const byRecovery = new Set<string>();
+		const dispatches = new Map<string, TurnEndDispatch>();
+		let pastDispatch = false;
 		const branch = this.sessionManager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
+			if (entry.type === "custom" && entry.customType === TURN_END_DISPATCHED_ENTRY) {
+				const dispatch = entry.data as TurnEndDispatch | undefined;
+				if (dispatch) dispatches.set(dispatch.messageEntryId, dispatch);
+				pastDispatch = true;
+				continue;
+			}
 			if (entry.type === "context_edit" && entry.replacement === null) {
 				omitted.add(entry.targetId);
+				if (!pastDispatch) byRecovery.add(entry.targetId);
 				continue;
 			}
 			if (entry.type !== "message") continue;
 			if (!omitted.has(entry.id)) return undefined;
-			if (entry.message.role === "assistant") return entry.message;
+			if (entry.message.role === "assistant") {
+				return {
+					message: entry.message,
+					recovery: byRecovery.has(entry.id),
+					dispatch: dispatches.get(entry.id),
+				};
+			}
 		}
 		return undefined;
 	}
@@ -2635,6 +2674,10 @@ export class AgentSession {
 			options?.preflightResult?.("started");
 			this._beginTurn();
 			await this._recordPrompt(messages);
+			// Right after the prompt, with nothing awaited between, and before anyone else can take
+			// the session. After the prompt, so a record that failed leaves no options for a turn
+			// that never started. A process that dies between the two writes still loses them.
+			this._recordTurnPromptOptions();
 			recorded = true;
 			// A recorded prompt starts a new turn, so the next model call prepares from nothing.
 			this.agent.startTurn();
@@ -2642,8 +2685,6 @@ export class AgentSession {
 			// Queued while busy, these belong before the step that answers the prompt.
 			this._releaseRun(recorded);
 		}
-		// Once the prompt is in, so a record that failed leaves no options for a turn never started.
-		this._recordTurnPromptOptions();
 		return true;
 	}
 

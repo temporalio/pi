@@ -1311,8 +1311,11 @@ export class SessionManager {
 			return result;
 		} catch (error) {
 			this._batch = undefined;
-			for (const entry of batch) this.byId.delete(entry.id);
 			this.fileEntries.splice(this.fileEntries.length - batch.length, batch.length);
+			// Append methods also update derived state, such as labels. Rebuilt from what the file
+			// holds, so none of it outlives the rolled-back entries. The leaf can be off the end of
+			// the file after a branch, so it goes back to what it was.
+			this._buildIndex();
 			this.leafId = leafBefore;
 			throw error;
 		}
