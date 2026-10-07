@@ -483,6 +483,64 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(modelCalls).toBe(0);
 	});
 
+	it("keeps what was queued during a settle that failed, so the retry still sees the open call", async () => {
+		await createSession();
+		seed([user("go"), assistant([call("hang-1"), call("hang-2")], "toolUse")]);
+		const append = sessionManager.appendMessage.bind(sessionManager);
+		let failed = false;
+		sessionManager.appendMessage = ((message: AgentMessage) => {
+			if (!failed && message.role === "toolResult" && message.toolCallId === "hang-2") {
+				failed = true;
+				throw new Error("disk said no");
+			}
+			return append(message as never);
+		}) as typeof sessionManager.appendMessage;
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
+			if (event.message.toolCallId !== "hang-1") return;
+			void session.sendCustomMessage(
+				{ customType: "note", content: "later", display: false },
+				{ triggerTurn: false },
+			);
+		});
+
+		expect(() => session.prepareStep()).toThrow("disk said no");
+		unsubscribe();
+		expect(session.agent.state.messages.some((m) => m.role === "custom")).toBe(false);
+
+		// The retry settles the call the failure left open, and the note goes in after the results.
+		expect(session.prepareStep()).toBe(true);
+		const roles = session.agent.state.messages.map((m) => m.role);
+		expect(roles).toEqual(["user", "assistant", "toolResult", "toolResult", "custom"]);
+	});
+
+	it("runs a second prompt's hooks only if its build gets the session", async () => {
+		let release = () => {};
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const seen: string[] = [];
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("before_agent_start", async (event) => {
+				seen.push(event.prompt);
+				await held;
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			harness.setResponses([fauxAssistantMessage("answer")]);
+			const first = harness.session.prompt("one");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			// Refused before its hooks run, so they cannot change the loadout under the first turn.
+			await expect(harness.session.prompt("two")).rejects.toThrow("already processing");
+			release();
+			await first;
+			expect(seen).toEqual(["one"]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("tells the loser of two concurrent starts that the session is taken", async () => {
 		let release = () => {};
 		await createSession(
