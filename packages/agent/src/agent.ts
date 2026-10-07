@@ -476,12 +476,6 @@ export class Agent {
 		if (!lastMessage) {
 			throw new Error("No messages to step from");
 		}
-		// A response that holds an answer is replayed; only one with nothing to act on is refused.
-		const stopped = lastMessage.role === "assistant" ? lastMessage.stopReason : undefined;
-		if (stopped === "error" || stopped === "aborted") {
-			throw new Error("Cannot step from message role: assistant");
-		}
-
 		// A failed run is handled inside the lifecycle, so the default stands and the caller
 		// dispatches nothing.
 		let outcome: AgentModelCallOutcome = {

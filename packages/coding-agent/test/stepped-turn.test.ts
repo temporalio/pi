@@ -317,6 +317,25 @@ describe("stepped turn", () => {
 		expect(getCurrentSystemPrompt(again.requests[0].messages)).toBe("Exact prompt.");
 	});
 
+	it("gives work after a finished turn the session's own options in a reopened session", async () => {
+		const extension = `export default p => p.on("before_agent_start", () => ({
+			systemPrompt: "Exact prompt.",
+		}));`;
+		const first = await createSession("finished-options", { extension });
+		await first.session.recordPrompt("go");
+		await driveStepped(first);
+
+		// Not through a prompt, so no turn of its own records options. It is the session's work.
+		const again = await reopen(first, "finished-options");
+		again.session.agent.state.messages = [
+			...again.session.agent.state.messages,
+			{ role: "user", content: [{ type: "text", text: "more" }], timestamp: Date.now() },
+		];
+		await again.session.modelCall();
+
+		expect(getCurrentSystemPrompt(again.requests[0].messages)).not.toBe("Exact prompt.");
+	});
+
 	it("keeps the turn's system prompt additions when a reopened session ends it", async () => {
 		const extension = `export default p => p.on("before_agent_start", (event) => {
 			const options = event.systemPromptOptions;
@@ -521,6 +540,29 @@ describe("stepped turn", () => {
 		const notes = SessionManager.open(file)
 			.getBranch()
 			.filter((entry) => entry.type === "custom" && entry.customType === "turn-note");
+		expect(notes).toHaveLength(1);
+	});
+
+	it("runs agent_before_settle once when a reopened final seal runs again", async () => {
+		const extension = `export default p => p.on("agent_before_settle", () => {
+			globalThis.reopenedSettles = (globalThis.reopenedSettles ?? 0) + 1;
+			return { entries: [{ type: "custom", customType: "settle-note", data: {} }] };
+		});`;
+		delete (globalThis as any).reopenedSettles;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("settled-reopened", { responses, extension });
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+		expect((await first.session.sealStep([])).done).toBe(true);
+
+		const again = await reopen(first, "settled-reopened-again", { responses, extension });
+		expect((await again.session.sealStep([])).done).toBe(true);
+
+		expect((globalThis as any).reopenedSettles).toBe(1);
+		delete (globalThis as any).reopenedSettles;
+		const notes = SessionManager.open(first.sessionManager.getSessionFile()!)
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "settle-note");
 		expect(notes).toHaveLength(1);
 	});
 
