@@ -323,6 +323,9 @@ export async function runAgentToolCall(
 	if (!assistantMessage || !toolCall) {
 		throw new Error(`No recorded tool call ${toolCallId} to run`);
 	}
+	if (!stillOpen(context.messages, assistantMessage)) {
+		throw new Error(`Cannot run call ${toolCallId}: a later message closed its step`);
+	}
 
 	// Against what preparation returned, when this step prepared. The tools of a step belong to the
 	// context and configuration that step's model call ran under, not to whatever the agent's state
@@ -399,6 +402,11 @@ export async function runAgentSeal(
 		// told the outcome is unknown, so the turn never ends with a call that has no result.
 		else batch.push(unknownToolCallOutcome(call));
 	}
+	// A result recorded after a message that closed the step pairs with nothing. A replay that has
+	// nothing left to record can still decide.
+	if (batch.some((call) => !existing.has(call.message.toolCallId)) && !stillOpen(context.messages, message)) {
+		throw new Error("Cannot seal: a later message closed the step");
+	}
 
 	const newMessages: AgentMessage[] = [];
 	const stepContext = cursor?.prepared?.context ?? context;
@@ -434,6 +442,18 @@ function clearCursor(cursor: StepCursor): void {
 	cursor.previousTurn = undefined;
 	cursor.prepared = undefined;
 	cursor.runtime = undefined;
+}
+
+/**
+ * Whether `message` is still the open step. Its own results and system messages can follow it.
+ * Anything else reaches the provider as a user turn, which closes the calls before it.
+ */
+function stillOpen(messages: ReadonlyArray<AgentMessage>, message: AgentMessage): boolean {
+	for (let index = messages.lastIndexOf(message) + 1; index < messages.length; index++) {
+		const role = messages[index].role;
+		if (role !== "toolResult" && role !== "system") return false;
+	}
+	return true;
 }
 
 /** The results recorded after `message`, by call id. */

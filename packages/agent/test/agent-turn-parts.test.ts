@@ -337,6 +337,20 @@ describe("seal", () => {
 		expect(stoppingOnly.hasMoreToolCalls).toBe(false);
 	});
 
+	it("refuses a call or a seal once a later message closed the step", async () => {
+		const plain = probeTool({ name: "plain" });
+		const { streamFn } = scriptedModel([() => createAssistantMessage([toolCall("t1", "plain")], "toolUse")]);
+		const context = contextWith([createUserMessage("go")], [plain.tool]);
+		const { emit } = collector();
+		await runAgentModelCall(context, config(), emit, undefined, streamFn);
+		context.messages.push(createUserMessage("something else"));
+
+		// A result now would come after a user turn, and pair with nothing.
+		await expect(runAgentToolCall(context, config(), "t1", emit, undefined)).rejects.toThrow("closed its step");
+		await expect(runAgentSeal(context, config(), [], emit, undefined)).rejects.toThrow("closed the step");
+		expect(recordedFor(context)).toEqual([]);
+	});
+
 	it("gives a call with no outcome and no recorded result an unknown one", async () => {
 		const plain = probeTool({ name: "plain" });
 		const { streamFn } = scriptedModel([
