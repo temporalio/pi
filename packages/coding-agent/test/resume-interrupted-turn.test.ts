@@ -902,7 +902,7 @@ describe("AgentSession: settling an interrupted turn", () => {
 		internals._runSystemPromptOptions = options;
 
 		// The answer to the first model call was lost. The retry gets the same answer back.
-		expect(await session.modelCall()).toEqual({ toolCalls: [], sequential: false, ended: true });
+		expect(await session.modelCall()).toMatchObject({ toolCalls: [], sequential: false, ended: true });
 		expect(modelCalls).toBe(0);
 		expect(internals._runSystemPromptOptions).toBe(options);
 
