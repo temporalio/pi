@@ -376,6 +376,9 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 }
 
 const UNSETTLED_CALLS_MESSAGE = "Tool calls have no result. Call prepareStep() first.";
+// Names the result a turn ended on when its tools asked it to stop. A transcript that ends on a
+// result otherwise reads as a turn with more to do.
+const TURN_ENDED_ON_RESULT_ENTRY = "pi.turn-ended-on-result";
 const BUILD_BUSY_MESSAGE = "Agent is already processing. Wait for completion before prompting.";
 
 // ============================================================================
@@ -1826,6 +1829,9 @@ export class AgentSession {
 				if (this._agentRunAbortRequested) break;
 				await this.agent.continue();
 			}
+			// Only a run that finished. A stopped or failed one can also end on a result, and that
+			// turn still has work.
+			if (!this._agentRunAbortRequested) this._markTurnEndedOnResult();
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
@@ -1895,6 +1901,31 @@ export class AgentSession {
 		}
 	}
 
+	/** Write down that the turn is over when it ends on a result, which only `terminate` does. */
+	private _markTurnEndedOnResult(): void {
+		const last = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
+		if (last?.role !== "toolResult") return;
+		const messageEntryId = this._findPersistedMessageEntryId(last);
+		if (!messageEntryId) return;
+		const entryId = this.sessionManager.appendCustomEntry(TURN_ENDED_ON_RESULT_ENTRY, { messageEntryId });
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry) this._emit({ type: "entry_appended", entry });
+	}
+
+	/** Whether the file says the turn ended on `message` on purpose. */
+	private _turnEndedOn(message: AgentMessage): boolean {
+		const messageEntryId = this._findPersistedMessageEntryId(message);
+		if (!messageEntryId) return false;
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.id === messageEntryId) return false;
+			if (entry.type !== "custom" || entry.customType !== TURN_ENDED_ON_RESULT_ENTRY) continue;
+			if ((entry.data as { messageEntryId?: string } | undefined)?.messageEntryId === messageEntryId) return true;
+		}
+		return false;
+	}
+
 	private _settleStoppedTurn(): boolean {
 		const messages = this.agent.state.messages;
 		const dangling = findDanglingToolCalls(messages);
@@ -1907,6 +1938,10 @@ export class AgentSession {
 		// The provider pairs results with calls past these, so they do not decide what comes next.
 		const last = messages.findLast((message) => !isOutsideToolPairing(message));
 		if (!last) {
+			return false;
+		}
+		// A turn whose tools asked it to stop ends on their results, and it is answered.
+		if (last.role === "toolResult" && this._turnEndedOn(last)) {
 			return false;
 		}
 		// Every other role reaches the provider as a user turn or a result, which a model call
