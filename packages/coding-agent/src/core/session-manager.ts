@@ -1320,6 +1320,9 @@ export class SessionManager {
 		try {
 			const result = write();
 			this._batch = undefined;
+			// Asked again right before the write. Time passes while the batch is built, and the
+			// guard has to answer for the moment the entries reach the file.
+			if (batch.length > 0) this._writeGuard?.();
 			this._persistEntries(batch);
 			return result;
 		} catch (error) {

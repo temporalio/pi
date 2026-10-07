@@ -1957,7 +1957,13 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._recordTurnPromptOptions();
+		// The build may hold the session for this turn, and only _drive() releases it from here on.
+		try {
+			this._recordTurnPromptOptions();
+		} catch (error) {
+			this._releaseRun(false);
+			throw error;
+		}
 		await this._drive(
 			() => this.agent.prompt(messages),
 			() => this._recordPrompt(Array.isArray(messages) ? messages : [messages]),
@@ -2057,7 +2063,7 @@ export class AgentSession {
 	 * prompt without what the turn added to it. A step in another process gets them from the file;
 	 * see _restoreTurnPromptOptions().
 	 */
-	private async _settleRun(turnDone = true): Promise<void> {
+	private async _settleRun(turnDone = true, completed = true): Promise<void> {
 		// The writes here can fail, a refused write guard included. The run ends either way, or the
 		// session stays busy for good.
 		try {
@@ -2070,8 +2076,12 @@ export class AgentSession {
 					this._appendInternalEntry(TURN_PROMPT_OPTIONS_ENTRY, { changes: {} });
 				}
 			}
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
+			// Not after a failure. Written into a step that's still open, they'd come between a call
+			// and its result.
+			if (completed) {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			}
 		} finally {
 			await this._emitAgentSettled();
 		}
@@ -2405,12 +2415,14 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		// A seal that throws leaves its step open, so the turn's state stays for the next try.
 		let done = false;
+		let sealed = false;
 		try {
-			const sealed = await this._sealStep(toolCalls, options);
-			done = sealed.done;
-			return sealed;
+			const result = await this._sealStep(toolCalls, options);
+			done = result.done;
+			sealed = true;
+			return result;
 		} finally {
-			await this._settleRun(done);
+			await this._settleRun(done, sealed);
 		}
 	}
 

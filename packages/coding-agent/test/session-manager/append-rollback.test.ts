@@ -148,6 +148,30 @@ describe("SessionManager: a failed append", () => {
 		expect(existsSync(manager.getSessionFile()!)).toBe(true);
 	});
 
+	it("asks the write guard again when a batch commits", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+		const lines = () =>
+			readFileSync(manager.getSessionFile()!, "utf8")
+				.split("\n")
+				.filter((l) => l.trim());
+		const before = lines().length;
+		let asked = 0;
+		manager.setWriteGuard(() => {
+			// Owned while the batch is built, lost by the time it is written.
+			if (++asked > 2) throw new Error("not ours to write");
+		});
+
+		expect(() =>
+			manager.batch(() => {
+				manager.appendCustomEntry("note", { n: 1 });
+				manager.appendCustomEntry("note", { n: 2 });
+			}),
+		).toThrow("not ours to write");
+		expect(manager.getLeafId()).toBe(first);
+		expect(lines().length).toBe(before);
+	});
+
 	it("takes a label back too when its batch fails", () => {
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
 		const first = manager.appendMessage(user("one"));

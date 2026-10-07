@@ -561,6 +561,31 @@ describe("stepped turn", () => {
 		expect(harness.session.isIdle).toBe(true);
 	});
 
+	it("keeps queued messages out of a step whose seal was refused", async () => {
+		const harness = await createSession("refused-seal-queue");
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const internals = harness.session as unknown as { _pendingCustomMessages: unknown[] };
+		internals._pendingCustomMessages = [
+			{ role: "custom", customType: "note", content: "later", display: false, timestamp: Date.now() },
+		];
+
+		await expect(harness.session.sealStep([], { expectCalls: ["other"] })).rejects.toThrow("Cannot seal");
+		// Written now, it would sit between the step's calls and their results.
+		expect(harness.session.agent.state.messages.some((m) => m.role === "custom")).toBe(false);
+		expect(internals._pendingCustomMessages).toHaveLength(1);
+	});
+
+	it("frees the session when the prompt's options can't be written", async () => {
+		const harness = await createSession("options-write-fails");
+		const internals = harness.session as unknown as { _recordTurnPromptOptions(): void };
+		internals._recordTurnPromptOptions = () => {
+			throw new Error("not ours to write");
+		};
+		await expect(harness.session.prompt("go")).rejects.toThrow("not ours to write");
+		expect(harness.session.isIdle).toBe(true);
+	});
+
 	it("keeps the turn's options when a seal is refused", async () => {
 		const harness = await createSession("refused-seal");
 		await harness.session.recordPrompt("go");
