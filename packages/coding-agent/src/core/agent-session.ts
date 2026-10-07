@@ -2312,6 +2312,12 @@ export class AgentSession {
 		this._restoreTurnPromptOptions();
 		const replayed = this._replayRecoverySeal(options);
 		if (replayed) return replayed;
+		// A seal that already ended the turn because its tools asked it to stop. The transcript
+		// does not keep `terminate`, so sealing again would read the results as asking for more.
+		const tail = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
+		if (tail?.role === "toolResult" && this._turnEndedOn(tail)) {
+			return { done: true, retryAttempt: 0, overflowRecoveryAttempted: false };
+		}
 		this._sealingStep = true;
 		let outcome: AgentStepOutcome;
 		try {
@@ -2383,6 +2389,10 @@ export class AgentSession {
 		const last = this.agent.state.messages[this.agent.state.messages.length - 1];
 		if (continueRequested && last && last.role !== "assistant") return false;
 		if (!runBoundary || this._agentRunAbortRequested) return true;
+		// A turn its tools stopped ends on their results. The marker tells a later seal or a
+		// reopened session that the turn is over, as it does for a turn run() drives. Not for a
+		// turn the user stopped, which still has work.
+		this._markTurnEndedOnResult();
 		// A seal that runs again ends the same turn again. The boundary already ran for it, and its
 		// entries are in the file, so running it again would add them twice.
 		const lastEntryId = last ? this._findPersistedMessageEntryId(last) : undefined;

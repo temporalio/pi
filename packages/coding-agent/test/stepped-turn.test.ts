@@ -111,6 +111,8 @@ describe("stepped turn", () => {
 			fastRetry?: boolean;
 			/** The session's own custom system prompt. */
 			systemPrompt?: string;
+			/** The tool asks the turn to stop. */
+			terminate?: boolean;
 		} = {},
 	): Promise<Harness> {
 		const ran: string[] = [];
@@ -124,7 +126,8 @@ describe("stepped turn", () => {
 			parameters: toolSchema,
 			async execute(_id, params) {
 				ran.push(params.q);
-				return { content: [{ type: "text", text: `did ${params.q}` }], details: { q: params.q } };
+				const result = { content: [{ type: "text" as const, text: `did ${params.q}` }], details: { q: params.q } };
+				return options.terminate ? { ...result, terminate: true } : result;
 			},
 		};
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
@@ -276,6 +279,7 @@ describe("stepped turn", () => {
 		extension?: string;
 		systemPrompt?: string;
 		fastRetry?: boolean;
+		terminate?: boolean;
 	};
 
 	/** One model call, its tool calls, and the seal. */
@@ -513,6 +517,22 @@ describe("stepped turn", () => {
 
 		expect((globalThis as any).steppedTurnEnds).toBe(1);
 		delete (globalThis as any).steppedTurnEnds;
+	});
+
+	it("keeps a turn its tools stopped over when the seal runs again in a reopened session", async () => {
+		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
+		const responses = [assistant([call], "toolUse"), assistant([{ type: "text", text: "never" }])];
+		const first = await createSession("stopped-by-tool", { responses, terminate: true });
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+		const result = await first.session.runToolCall("call_1");
+		expect((await first.session.sealStep(result ? [result] : [], { expectCalls: ["call_1"] })).done).toBe(true);
+
+		// The transcript ends on the result. Without the marker it reads as a turn with more to do.
+		const again = await reopen(first, "stopped-by-tool-again", { responses, terminate: true });
+		expect(again.session.prepareStep()).toBe(false);
+		expect((await again.session.sealStep([], { expectCalls: ["call_1"] })).done).toBe(true);
+		expect(again.asked()).toBe(0);
 	});
 
 	it("finishes a turn once when its seal runs again in a reopened session", async () => {

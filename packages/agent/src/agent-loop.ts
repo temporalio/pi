@@ -384,7 +384,8 @@ export async function runAgentSeal(
 	// can already have its result in the transcript. A seal that ran before and lost its answer
 	// recorded it, and runToolCall() reports nothing for it now. Counting it keeps the decision
 	// the same as the first seal's. The transcript does not keep `terminate`, so such a result
-	// counts as one that asks for another step.
+	// counts as one that asks for another step. AgentSession marks a turn its tools stopped and
+	// checks that before it seals, so only a caller of this function alone sees the extra step.
 	const provided = new Map(toolCalls.map((call) => [call.message.toolCallId, call]));
 	const existing = resultsAfter(context.messages, message);
 	const batch: TurnToolCallOutcome[] = [];
