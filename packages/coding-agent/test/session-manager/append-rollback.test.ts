@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false }));
+const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false, tearNextAppend: false }));
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
@@ -22,6 +22,12 @@ vi.mock("node:fs", async (importOriginal) => {
 			if (state.failNextAppend) {
 				state.failNextAppend = false;
 				throw new Error("disk said no");
+			}
+			if (state.tearNextAppend) {
+				// Part of the line lands, then the disk fills up.
+				state.tearNextAppend = false;
+				actual.appendFileSync(args[0], String(args[1]).slice(0, 12));
+				throw new Error("disk full");
 			}
 			return actual.appendFileSync(...args);
 		}) as typeof actual.appendFileSync,
@@ -81,5 +87,20 @@ describe("SessionManager: a failed append", () => {
 			.filter((entry) => entry.type === "message")
 			.map((entry) => entry.id);
 		expect(ids).toEqual([first]);
+	});
+
+	it("cuts off the part of a line a failed append left, so the retry is read back", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+
+		state.tearNextAppend = true;
+		expect(() => manager.appendMessage(user("two"))).toThrow("disk full");
+		const second = manager.appendMessage(user("two"));
+
+		const ids = SessionManager.open(manager.getSessionFile()!)
+			.getBranch()
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.id);
+		expect(ids).toEqual([first, second]);
 	});
 });

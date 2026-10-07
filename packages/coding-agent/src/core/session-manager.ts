@@ -24,6 +24,7 @@ import {
 	rmSync,
 	type Stats,
 	statSync,
+	truncateSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -1245,7 +1246,19 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			// An append that fails can still leave part of its line. Cut the file back, or the
+			// retry's line joins that part and the loader drops both as one bad line.
+			const size = statSync(this.sessionFile).size;
+			try {
+				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			} catch (error) {
+				try {
+					truncateSync(this.sessionFile, size);
+				} catch {
+					// The append's own error is the one the caller needs.
+				}
+				throw error;
+			}
 		}
 	}
 

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	type AssistantMessage,
@@ -142,6 +142,7 @@ describe("AgentSession: settling an interrupted turn", () => {
 	async function createSession(
 		replies: AssistantMessage[] = [answer("all handled")],
 		gate: Promise<void> = Promise.resolve(),
+		tools?: Record<string, AgentTool>,
 	): Promise<AgentSession> {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
@@ -173,6 +174,7 @@ describe("AgentSession: settling an interrupted turn", () => {
 			cwd: tempDir,
 			modelRuntime: getModelRuntime(modelRegistry),
 			resourceLoader: createTestResourceLoader(),
+			baseToolsOverride: tools,
 		});
 		return session;
 	}
@@ -503,6 +505,28 @@ describe("AgentSession: settling an interrupted turn", () => {
 
 		expect(modelCalls).toBe(0);
 		expect(session.agent.hasQueuedMessages()).toBe(true);
+	});
+
+	it("reads a turn its tools stopped as answered, also after a reopen", async () => {
+		const stop = {
+			name: "do",
+			label: "Do",
+			description: "Asks the turn to stop",
+			parameters: { type: "object", properties: {} },
+			execute: async () => ({ content: [{ type: "text", text: "stopped" }], details: {}, terminate: true }),
+		} as unknown as AgentTool;
+		await createSession([assistant([call("stop-1")], "toolUse"), answer("never")], undefined, { do: stop });
+
+		await session.prompt("go");
+		expect(modelCalls).toBe(1);
+		expect(session.agent.state.messages.at(-1)?.role).toBe("toolResult");
+		expect(session.prepareStep()).toBe(false);
+
+		// A driver that opens the file again must not ask the model to answer a stopped turn.
+		const reopened = SessionManager.open(sessionManager.getSessionFile()!);
+		const projection = reopened.buildSessionProjection().messages;
+		session.agent.state.messages = projection;
+		expect(session.prepareStep()).toBe(false);
 	});
 
 	it("is busy while compaction runs", async () => {
