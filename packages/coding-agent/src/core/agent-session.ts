@@ -2096,13 +2096,13 @@ export class AgentSession {
 			return;
 		}
 
-		// Same race as in recordPrompt(): the builder awaited, so a recording or another prompt can
-		// hold the session by now. _drive() claims it synchronously from here, so one check closes
-		// the window.
-		if (this._isAgentRunActive) {
-			throw new Error(BUILD_BUSY_MESSAGE);
+		// The builder holds the session for this call, and the turn takes it over from here.
+		try {
+			options?.preflightResult?.("started");
+		} catch (error) {
+			this._releaseRun();
+			throw error;
 		}
-		options?.preflightResult?.("started");
 		await this._runAgentPrompt(messages);
 	}
 
@@ -2139,23 +2139,12 @@ export class AgentSession {
 			return false;
 		}
 
-		// The builder awaited, so the claim must be taken in the same synchronous block as this
-		// check, or two callers both pass before either claims. A run that started meanwhile owns
-		// the transcript, and recording into it would land the prompt inside someone else's step.
-		if (this._isAgentRunActive) {
-			throw new Error(BUILD_BUSY_MESSAGE);
-		}
-		// Again, for a run that stopped during the build's awaits and left calls open. That is
-		// rare, and the build has taken its inputs by now, but a prompt between a call and its
-		// result is worse.
-		refuseUnsettled();
-
-		options?.preflightResult?.("started");
-		this._beginTurn();
-		// Recording awaits the extensions' message handlers. Busy until the prompt is in, or a step
-		// that started in between would answer part of it.
-		this._isAgentRunActive = true;
+		// The builder holds the session for this call. It stays busy until the prompt is in,
+		// because recording awaits the extensions' message handlers, and a step that started in
+		// between would answer part of it.
 		try {
+			options?.preflightResult?.("started");
+			this._beginTurn();
 			// The loop declares a prompt's loadout as it adds the prompt; a recorded one never
 			// reaches it.
 			const { messages: transcript, tools } = this.agent.state;
@@ -2169,12 +2158,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
-	 * when the text needed no run at all.
-	 */
-	/**
+	 * All of prompt() except the running of it. Returns the turn's messages with the session held
+	 * for the caller, or undefined when the text needed no run at all.
+	 *
 	 * `beforeBuild` runs once the text is known to start a new turn, before anything is taken from
 	 * the queues or the prompt options change, so a caller can still refuse without side effects.
+	 * It runs again after the last await, for what changed while the build waited.
 	 */
 	private async _buildPromptMessages(
 		text: string,
@@ -2291,6 +2280,27 @@ export class AgentSession {
 		if (this._isAgentRunActive) {
 			throw new Error(BUILD_BUSY_MESSAGE);
 		}
+		// A run that stopped during the awaits can have left calls open.
+		beforeBuild?.();
+		// Claimed in the same synchronous block as the check, before the loadout and the options
+		// change. A second builder that resumes before this caller does then finds the session
+		// busy, instead of putting its own loadout under this caller's turn. The caller gets the
+		// session held and releases it.
+		this._isAgentRunActive = true;
+		try {
+			return this._finishPromptMessages(expandedText, normalized, result);
+		} catch (error) {
+			this._releaseRun();
+			throw error;
+		}
+	}
+
+	/** The synchronous end of the build, run with the session held. */
+	private _finishPromptMessages(
+		expandedText: string,
+		normalized: { images: ImageContent[]; hints: string[] },
+		result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>,
+	): AgentMessage[] {
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
