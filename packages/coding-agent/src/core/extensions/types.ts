@@ -1516,10 +1516,7 @@ export interface TurnSteps {
 	modelCall(): Promise<AgentModelCallOutcome>;
 	/** Undefined when the transcript already held a result for the call, so nothing ran. */
 	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
-	sealStep(
-		results: ReadonlyArray<TurnToolCallOutcome>,
-		options?: SealStepOptions,
-	): Promise<{ done: boolean; retryAttempt: number }>;
+	sealStep(results: ReadonlyArray<TurnToolCallOutcome>, options?: SealStepOptions): Promise<SealStepResult>;
 }
 
 export interface SealStepOptions {
@@ -1528,9 +1525,21 @@ export interface SealStepOptions {
 	expectCalls?: ReadonlyArray<string>;
 	/** The retry count a caller carries between seals, for a session rebuilt per step. */
 	retryAttempt?: number;
+	/** Whether the turn already spent its one compact-and-retry. Carried the same way. */
+	overflowRecoveryAttempted?: boolean;
 	/** Record the results and stop. What answers for a step that went wrong is a provider retry or a
 	 * compaction, and neither is work to do on a turn the user just stopped. */
 	postRun?: boolean;
+}
+
+/** What a seal decided. A caller that rebuilds the session per step carries the counts. */
+export interface SealStepResult {
+	/** The turn has nothing left to do. */
+	done: boolean;
+	/** Pass back as `retryAttempt` on the next seal. */
+	retryAttempt: number;
+	/** Pass back as `overflowRecoveryAttempted` on the next seal. */
+	overflowRecoveryAttempted: boolean;
 }
 
 /** The turn an executor was handed. */

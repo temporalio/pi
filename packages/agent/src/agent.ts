@@ -375,9 +375,14 @@ export class Agent {
 		return this._interrupted;
 	}
 
-	/** Start a fresh turn. Callers that drive the steps themselves own the turn boundary. */
-	clearInterrupt(): void {
+	/**
+	 * Start a fresh turn. A stop asked for during the last turn does not carry in, and neither does
+	 * what the last turn's steps left for the next one. Callers that drive the steps themselves own
+	 * the turn boundary, so they call this before a new turn's first model call.
+	 */
+	startTurn(): void {
 		this._interrupted = false;
+		this.stepCursor = {};
 	}
 
 	/**
@@ -403,6 +408,8 @@ export class Agent {
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
+		// The conversation it belongs to is gone.
+		this.stepCursor = {};
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */

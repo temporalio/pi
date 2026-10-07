@@ -151,6 +151,7 @@ export type {
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
 	SealStepOptions,
+	SealStepResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,

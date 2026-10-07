@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { TurnSteps } from "../src/core/extensions/index.ts";
@@ -42,7 +42,7 @@ const noSteps: TurnSteps = {
 	interrupted: () => false,
 	modelCall: async () => ({ toolCalls: [], sequential: false, ended: true }),
 	runToolCall: async () => undefined,
-	sealStep: async () => ({ done: true, retryAttempt: 0 }),
+	sealStep: async () => ({ done: true, retryAttempt: 0, overflowRecoveryAttempted: false }),
 };
 
 function assistant(text: string): AssistantMessage {
@@ -259,6 +259,25 @@ describe("turn executor", () => {
 
 		expect((globalThis as any).turnsSeen).toBeUndefined();
 		expect(modelCalls).toBe(0);
+	});
+
+	it("does not run a turn the user stopped while the executor held it", async () => {
+		await createSession(
+			`export default p => p.registerTurnExecutor(async turn => {
+				globalThis.turnsSeen = turn;
+				await new Promise(resolve => { globalThis.releaseTurn = resolve; });
+				await turn.run();
+			});`,
+		);
+		const prompted = session!.prompt("go");
+		await vi.waitFor(() => expect((globalThis as any).releaseTurn).toBeDefined());
+
+		const stopped = session!.abort();
+		(globalThis as any).releaseTurn();
+		await Promise.all([stopped, prompted]);
+
+		expect(modelCalls).toBe(0);
+		delete (globalThis as any).releaseTurn;
 	});
 
 	it("leaves the turn unrun when the executor never runs it", async () => {

@@ -101,6 +101,7 @@ import {
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
 	type SealStepOptions,
+	type SealStepResult,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionBoundaryDraft,
@@ -909,18 +910,34 @@ export class AgentSession {
 			},
 			(entries) => this._buildBoundaryContext(entries, "turn_end"),
 		);
-		this._commitBoundaryDrafts(boundary.entries);
+		// The drafts and the decision go in one write, so the file holds both or neither. A seal
+		// that runs again reads the decision and must not commit the drafts a second time. The
+		// decision comes last because a cut write keeps a prefix, and drafts without it only
+		// repeat the hook. The decision without its drafts would lose them.
+		let appended: SessionEntry[] = [];
 		let shouldContinue = boundary.continue;
-		if (shouldContinue && !this._buildBoundaryContext([], "turn_end").canContinue) {
-			this._reportInvalidBoundaryContinuation("turn_end");
-			shouldContinue = false;
+		try {
+			this.sessionManager.batch(() => {
+				appended = this._applyBoundaryDrafts(this.sessionManager, boundary.entries);
+				this._refreshFinalizedContext();
+				if (shouldContinue && !this._buildBoundaryContext([], "turn_end").canContinue) {
+					this._reportInvalidBoundaryContinuation("turn_end");
+					shouldContinue = false;
+				}
+				if (this._sealingStep) {
+					const dispatch: TurnEndDispatch = { messageEntryId, continue: shouldContinue };
+					const entry = this.sessionManager.getEntry(
+						this.sessionManager.appendCustomEntry(TURN_END_DISPATCHED_ENTRY, dispatch),
+					);
+					if (entry) appended.push(entry);
+				}
+			});
+		} catch (error) {
+			// Memory went back to what the file holds, so the context has to follow it.
+			this._refreshFinalizedContext();
+			throw error;
 		}
-		// With the drafts and nothing awaited in between, so the file holds both or neither. The
-		// decision goes with them: a seal that runs again has to end the turn the same way.
-		if (this._sealingStep) {
-			const dispatch: TurnEndDispatch = { messageEntryId, continue: shouldContinue };
-			this._appendInternalEntry(TURN_END_DISPATCHED_ENTRY, dispatch);
-		}
+		for (const entry of appended) this._emit({ type: "entry_appended", entry });
 		return shouldContinue;
 	}
 
@@ -1874,6 +1891,9 @@ export class AgentSession {
 	private async _drive(initial: () => Promise<void>, record: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		const run = async () => {
+			// An executor can hold the turn and call this after the user stopped it. The agent has
+			// no run to abort until this starts one, and starting one clears its stop.
+			if (this._agentRunAbortRequested) return;
 			await initial();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
@@ -1905,8 +1925,8 @@ export class AgentSession {
 			this._beginTurn();
 			// A resumed turn can have started in another process.
 			this._restoreTurnPromptOptions();
-			// The turn starts here, so a stop asked for during the last one does not carry into it.
-			this.agent.clearInterrupt();
+			// The turn starts here, so nothing from the last one carries into it.
+			this.agent.startTurn();
 			// An extension can take over when the turn runs. It is handed the same run(), so a
 			// turn that goes through an executor and one that does not are the same turn.
 			const registered = this._extensionRunner.getTurnExecutor();
@@ -2210,12 +2230,20 @@ export class AgentSession {
 		// A tool can read the system prompt, and this can be the first thing a process does.
 		const restored = this._runSystemPromptOptions === undefined;
 		this._restoreTurnPromptOptions();
+		// The session is busy while the tool runs, also when this process did not open the step.
+		// Otherwise prepareStep() would settle the call as unknown while it is still running.
+		const opened = !this._isAgentRunActive;
+		this._isAgentRunActive = true;
 		try {
 			return await this.agent.runToolCall(toolCallId);
 		} finally {
 			// No settle follows a tool call here, and options left behind would outlive the turn
 			// when its seal runs somewhere else.
 			if (restored) this._runSystemPromptOptions = undefined;
+			if (opened) {
+				this._isAgentRunActive = false;
+				this._resolveIdleWaitIfIdle();
+			}
 		}
 	}
 
@@ -2227,7 +2255,10 @@ export class AgentSession {
 	async sealStep(
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 		options: SealStepOptions = {},
-	): Promise<{ done: boolean; retryAttempt: number }> {
+	): Promise<SealStepResult> {
+		// Busy until the seal settles, also when this process did not open the step, so a prompt
+		// sent while turn_end handlers run queues instead of being refused.
+		this._isAgentRunActive = true;
 		let done = true;
 		try {
 			const sealed = await this._sealStep(toolCalls, options);
@@ -2242,9 +2273,11 @@ export class AgentSession {
 	private async _sealStep(
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 		options: SealStepOptions = {},
-	): Promise<{ done: boolean; retryAttempt: number }> {
+	): Promise<SealStepResult> {
 		// turn_end handlers and a compaction after the seal can read the system prompt.
 		this._restoreTurnPromptOptions();
+		const replayed = this._replayRecoverySeal(options);
+		if (replayed) return replayed;
 		this._sealingStep = true;
 		let outcome: AgentStepOutcome;
 		try {
@@ -2253,13 +2286,55 @@ export class AgentSession {
 			this._sealingStep = false;
 		}
 		// Retries and compaction live here, so a stepped turn keeps both.
-		const needsAnotherPass = options.postRun === false ? false : await this._postSealPass(options.retryAttempt);
+		const needsAnotherPass =
+			options.postRun === false
+				? false
+				: await this._postSealPass(options.retryAttempt, options.overflowRecoveryAttempted);
 		let done = !outcome.hasMoreToolCalls && !needsAnotherPass;
 		if (done) done = await this._settleSteppedTurn(options.postRun !== false);
 		if (!done) await this._admitQueuedMessages();
-		// The count is handed back so a caller that outlives this session can carry it to the next
-		// seal; the transcript it could be read from is something a compaction rewrites.
-		return { done, retryAttempt: this._retryAttempt };
+		// The counts are handed back so a caller that outlives this session can carry them to the
+		// next seal. The transcript they could be read from is something a compaction rewrites.
+		return { done, retryAttempt: this._retryAttempt, overflowRecoveryAttempted: this._overflowRecoveryAttempted };
+	}
+
+	/**
+	 * The answer of a seal that already ran, decided a retry or a compact-and-retry, and lost its
+	 * answer. That seal took the failed response out of the model's context, so the step it closed
+	 * is not there to seal again. The file still holds the response, which says what was decided.
+	 */
+	private _replayRecoverySeal(options: SealStepOptions): SealStepResult | undefined {
+		const omitted = this._findOmittedStepResponse();
+		if (!omitted) return undefined;
+		const carried = options.retryAttempt ?? 0;
+		const retried = this._isRetryableError(omitted);
+		return {
+			done: false,
+			// A provider retry spent one attempt. A compact-and-retry spent the one recovery.
+			retryAttempt: retried ? carried + 1 : carried,
+			overflowRecoveryAttempted: retried ? (options.overflowRecoveryAttempted ?? false) : true,
+		};
+	}
+
+	/**
+	 * The step's response, when a recovery took it out of the model's context and nothing came
+	 * after it. Only the entries after the last message the model still sees are read, so a
+	 * response the model answered again is not found.
+	 */
+	private _findOmittedStepResponse(): AssistantMessage | undefined {
+		const omitted = new Set<string>();
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "context_edit" && entry.replacement === null) {
+				omitted.add(entry.targetId);
+				continue;
+			}
+			if (entry.type !== "message") continue;
+			if (!omitted.has(entry.id)) return undefined;
+			if (entry.message.role === "assistant") return entry.message;
+		}
+		return undefined;
 	}
 
 	/**
@@ -2295,7 +2370,7 @@ export class AgentSession {
 	 * and consumes, so on either path it finds nothing and reports a turn that is over: a provider
 	 * error never retries and a full context never compacts.
 	 */
-	private async _postSealPass(retryAttempt?: number): Promise<boolean> {
+	private async _postSealPass(retryAttempt?: number, overflowRecoveryAttempted?: boolean): Promise<boolean> {
 		// Before anything derived from a message, because this is the case where the message is gone.
 		if (this._pendingRetry) {
 			return true;
@@ -2309,6 +2384,12 @@ export class AgentSession {
 		if (this._retryAttempt === 0) {
 			this._retryAttempt = retryAttempt ?? 0;
 		}
+		// The same for the one compact-and-retry a turn gets. An answer that came back whole ends
+		// the recovery, as the message event does in a live session.
+		const answered =
+			this._lastAssistantMessage?.stopReason !== "error" && this._lastAssistantMessage?.stopReason !== "length";
+		if (overflowRecoveryAttempted && !answered) this._overflowRecoveryAttempted = true;
+		if (answered) this._overflowRecoveryAttempted = false;
 		return this._handlePostAgentRun();
 	}
 
@@ -2496,6 +2577,8 @@ export class AgentSession {
 			this._beginTurn();
 			await this._recordPrompt(messages);
 			recorded = true;
+			// A recorded prompt starts a new turn, so the next model call prepares from nothing.
+			this.agent.startTurn();
 		} finally {
 			// Queued while busy, these belong before the step that answers the prompt.
 			this._releaseRun(recorded);

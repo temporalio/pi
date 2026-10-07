@@ -1051,6 +1051,8 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private _writeGuard?: () => void;
+	// Entries appended inside batch(), held for its single write.
+	private _batch?: SessionEntry[];
 
 	private constructor(
 		cwd: string,
@@ -1225,7 +1227,11 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
+		this._persistEntries([entry]);
+	}
+
+	private _persistEntries(entries: SessionEntry[]): void {
+		if (!this.persist || !this.sessionFile || entries.length === 0) return;
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
@@ -1246,11 +1252,11 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			// An append that fails can still leave part of its line. Cut the file back, or the
-			// retry's line joins that part and the loader drops both as one bad line.
+			// An append that fails can still leave part of its lines. Cut the file back, or the
+			// retry's lines join that part and the loader drops both as one bad line.
 			const size = statSync(this.sessionFile).size;
 			try {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(this.sessionFile, entries.map((e) => `${JSON.stringify(e)}\n`).join(""));
 			} catch (error) {
 				try {
 					truncateSync(this.sessionFile, size);
@@ -1271,11 +1277,42 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		if (this._batch) {
+			this._batch.push(entry);
+			return;
+		}
 		try {
 			this._persist(entry);
 		} catch (error) {
 			this.fileEntries.pop();
 			this.byId.delete(entry.id);
+			this.leafId = leafBefore;
+			throw error;
+		}
+	}
+
+	/**
+	 * Run `write` and put every entry it appends in the file with one write, so a process that
+	 * dies part way leaves all of them or none. A failure takes them all back out of memory too.
+	 * Readers see the entries as soon as they are appended. A call inside a batch joins it.
+	 *
+	 * One append of a few lines is all-or-nothing when a process dies. A power loss can still
+	 * cut the last line, and the loader drops a cut line, so order the entries with that in mind.
+	 */
+	batch<T>(write: () => T): T {
+		if (this._batch) return write();
+		const batch: SessionEntry[] = [];
+		const leafBefore = this.leafId;
+		this._batch = batch;
+		try {
+			const result = write();
+			this._batch = undefined;
+			this._persistEntries(batch);
+			return result;
+		} catch (error) {
+			this._batch = undefined;
+			for (const entry of batch) this.byId.delete(entry.id);
+			this.fileEntries.splice(this.fileEntries.length - batch.length, batch.length);
 			this.leafId = leafBefore;
 			throw error;
 		}

@@ -275,6 +275,7 @@ describe("stepped turn", () => {
 		responses?: AssistantMessage[];
 		extension?: string;
 		systemPrompt?: string;
+		fastRetry?: boolean;
 	};
 
 	/** One model call, its tool calls, and the seal. */
@@ -619,6 +620,39 @@ describe("stepped turn", () => {
 		expect(harness.asked()).toBe(1);
 	});
 
+	it("answers a retry seal that lost its answer the same way in a reopened session", async () => {
+		const failed = assistant([{ type: "text", text: "" }], "error");
+		failed.errorMessage = "overloaded";
+		const responses = [failed, assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("lost-retry", { responses, fastRetry: true });
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+		const decided = await first.session.sealStep([], { retryAttempt: 0 });
+		expect(decided).toMatchObject({ done: false, retryAttempt: 1 });
+
+		// The failed response is out of the model's context, so there is no step left to seal.
+		// The driver still holds the count it had before the lost answer.
+		const again = await reopen(first, "lost-retry-again", { responses, fastRetry: true });
+		expect(await again.session.sealStep([], { retryAttempt: 0 })).toEqual(decided);
+	});
+
+	it("is busy while a reopened session runs a tool call", async () => {
+		const first = await createSession("busy-tool");
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+
+		const again = await reopen(first, "busy-tool-again");
+		const seen: Array<boolean | "busy"> = [];
+		again.session.subscribe((event) => {
+			if (event.type === "tool_execution_start") seen.push(again.session.prepareStep());
+		});
+		await again.session.runToolCall("call_1");
+
+		// Settling now would record an unknown outcome for a call that is still running.
+		expect(seen).toEqual(["busy"]);
+		expect(again.session.isIdle).toBe(true);
+	});
+
 	it("gives a step that got an answer a fresh retry budget", async () => {
 		// The count is carried across activities by the caller, and a session rebuilt per activity
 		// never sees the message event that resets it in a live one. Without the reset here, three
@@ -629,9 +663,10 @@ describe("stepped turn", () => {
 			assistant([{ type: "text", text: "an answer" }]),
 		];
 
-		const { retryAttempt } = await harness.session.sealStep([], { retryAttempt: 3 });
+		const result = await harness.session.sealStep([], { retryAttempt: 3, overflowRecoveryAttempted: true });
 
-		expect(retryAttempt).toBe(0);
+		// The compact-and-retry a turn gets ends with an answer too.
+		expect(result).toMatchObject({ retryAttempt: 0, overflowRecoveryAttempted: false });
 	});
 
 	it("refuses a second model call while the step is still open", async () => {

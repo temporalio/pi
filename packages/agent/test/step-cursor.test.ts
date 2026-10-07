@@ -1,7 +1,6 @@
 // Preparation belongs to the turn that follows the one that just ended, and the loop keeps the
-// turn it ended in a local. A caller stepping from outside has no such local, so every external
-// entry point missed it: `prompt()` prepared and `step()` did not, on the same agent, with the
-// same responses. A review reproduced that with a callback that changes the system prompt.
+// turn it ended in a local. A caller stepping from outside has no such local, so the agent holds
+// it for them.
 //
 // What is checked here is the whole contract, not the callback firing: preparation runs once per
 // completed step, what it returns reaches the calls and the seal that follow, a replayed model
@@ -55,7 +54,7 @@ interface Recorded {
 	sealPhase: string[];
 }
 
-function agentUnderTest() {
+function agentUnderTest(options: { prepareOnce?: boolean } = {}) {
 	const recorded: Recorded = { prepared: 0, prompts: [], models: [], toolPhase: [], sealPhase: [] };
 	let calls = 0;
 	const agent = new Agent({
@@ -72,6 +71,7 @@ function agentUnderTest() {
 			// The genuine completed turn, not something rebuilt from the transcript.
 			expect(turn.toolResults.length).toBe(1);
 			expect(turn.message.content.some((block) => block.type === "toolCall")).toBe(true);
+			if (options.prepareOnce && recorded.prepared > 1) return undefined;
 			return { context: { ...turn.context, label: "prepared" } as Labelled, model: PREPARED_MODEL as never };
 		},
 		streamFn: (model) => {
@@ -206,6 +206,31 @@ describe("the step cursor", () => {
 
 		expect(recorded.prompts[1]).toBe("original");
 	});
+	it("keeps the model preparation chose when a later preparation returns nothing", async () => {
+		const { agent, recorded } = agentUnderTest({ prepareOnce: true });
+		await driveStep(agent);
+		await driveStep(agent);
+		await driveStep(agent);
+
+		// The loop keeps a replacement for the rest of the run, and so does a stepped turn.
+		expect(recorded.prepared).toBe(2);
+		expect(recorded.models.slice(1)).toEqual([PREPARED_MODEL, PREPARED_MODEL]);
+	});
+
+	it("forgets what the last run's steps left behind on reset() and startTurn()", async () => {
+		for (const fresh of [(agent: Agent) => agent.reset(), (agent: Agent) => agent.startTurn()]) {
+			const { agent, recorded } = agentUnderTest();
+			await driveStep(agent);
+			fresh(agent);
+			agent.state.messages = [{ role: "user", content: "new task", timestamp: Date.now() }];
+
+			// A new run starts from no completed turn, so it does not prepare from the old task.
+			await agent.modelCall();
+			expect(recorded.prepared).toBe(0);
+			expect(recorded.prompts).toEqual(["original", "original"]);
+		}
+	});
+
 	it("refuses a model call that has nothing to start from, and records nothing", async () => {
 		const { agent, recorded } = agentUnderTest();
 		await driveStep(agent);

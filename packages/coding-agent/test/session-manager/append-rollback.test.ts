@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false, tearNextAppend: false }));
+const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false, tearNextAppend: false, appends: 0 }));
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
@@ -19,6 +19,7 @@ vi.mock("node:fs", async (importOriginal) => {
 			return actual.writeFileSync(...args);
 		}) as typeof actual.writeFileSync,
 		appendFileSync: ((...args: Parameters<typeof actual.appendFileSync>) => {
+			state.appends++;
 			if (state.failNextAppend) {
 				state.failNextAppend = false;
 				throw new Error("disk said no");
@@ -102,5 +103,33 @@ describe("SessionManager: a failed append", () => {
 			.filter((entry) => entry.type === "message")
 			.map((entry) => entry.id);
 		expect(ids).toEqual([first, second]);
+	});
+
+	it("writes a batch with one append, and takes all of it back when that append fails", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+		const lines = () =>
+			readFileSync(manager.getSessionFile()!, "utf8")
+				.split("\n")
+				.filter((l) => l.trim());
+		const before = lines().length;
+
+		state.failNextAppend = true;
+		expect(() =>
+			manager.batch(() => {
+				manager.appendCustomEntry("note", { n: 1 });
+				manager.appendCustomEntry("note", { n: 2 });
+			}),
+		).toThrow("disk said no");
+		expect(manager.getLeafId()).toBe(first);
+		expect(lines().length).toBe(before);
+
+		state.appends = 0;
+		manager.batch(() => {
+			manager.appendCustomEntry("note", { n: 1 });
+			manager.appendCustomEntry("note", { n: 2 });
+		});
+		expect(state.appends).toBe(1);
+		expect(lines().length).toBe(before + 2);
 	});
 });
