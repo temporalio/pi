@@ -189,14 +189,24 @@ export function unknownToolCallOutcome(toolCall: { id: string; name: string }): 
 /**
  * What one step leaves behind for the next one, held by a caller driving the loop from outside the
  * way `runLoop` holds it in a local. `previousTurn` is the completed turn the app's preparation
- * callback is handed; it cannot be rebuilt from the transcript, which a compaction rewrites.
+ * callback is handed. It cannot be rebuilt from the transcript, which a compaction rewrites.
  * `prepared` is what that callback returned, which can replace the context and the model, so the
  * tools and the seal of the step run against it. It lives until the step is sealed, which is also
  * what makes a retried model call reuse the preparation instead of running it twice.
+ *
+ * It lives in memory only. A unit of work in a process that never saw the earlier ones starts
+ * without it. Its first model call does not prepare, and its tools and seal use the agent's own
+ * context and config. A driver that moves steps between processes needs a preparation callback
+ * whose results are in the transcript or are cheap to make again.
  */
 export interface StepCursor {
 	previousTurn?: PrepareNextTurnContext;
 	prepared?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
+	/**
+	 * The model and thinking level the last preparation chose. The loop keeps them for the rest of
+	 * the run when a later preparation returns nothing, so the next step starts from them too.
+	 */
+	runtime?: Pick<AgentLoopConfig, "model" | "reasoning">;
 }
 
 export interface AgentModelCallOutcome {
@@ -259,9 +269,10 @@ export async function runAgentModelCall(
 	// this is another one. Preparing again would run the app's callback twice for one step, and
 	// compaction is the kind of thing that callback does.
 	const retry = cursor?.prepared;
+	const runConfig = cursor?.runtime ? { ...config, ...cursor.runtime } : config;
 	const outcome = await runTurnModelCall({
 		context: retry ? { ...retry.context } : { ...context },
-		config: retry ? retry.config : config,
+		config: retry ? retry.config : runConfig,
 		newMessages: [],
 		pendingMessages: [],
 		previousTurn: retry ? undefined : cursor?.previousTurn,
@@ -270,6 +281,7 @@ export async function runAgentModelCall(
 					// Recorded here rather than after the call returns, so an attempt that dies in
 					// the provider does not leave the next one preparing the same step again.
 					cursor.prepared = state;
+					cursor.runtime = { model: state.config.model, reasoning: state.config.reasoning };
 					cursor.previousTurn = undefined;
 				}
 			: undefined,
@@ -299,11 +311,12 @@ export async function runAgentToolCall(
 	signal: AbortSignal | undefined,
 	cursor?: StepCursor,
 ): Promise<TurnToolCallOutcome | undefined> {
-	if (context.messages.some((m) => m.role === "toolResult" && m.toolCallId === toolCallId)) {
+	const assistantMessage = lastAssistantMessage(context.messages);
+	// Call ids are unique only within one response, so only this step's results count.
+	if (assistantMessage && resultsAfter(context.messages, assistantMessage).has(toolCallId)) {
 		return undefined;
 	}
 
-	const assistantMessage = lastAssistantMessage(context.messages);
 	const toolCall = assistantMessage?.content.find(
 		(c): c is AgentToolCall => c.type === "toolCall" && c.id === toolCallId,
 	);
@@ -362,10 +375,24 @@ export async function runAgentSeal(
 	// record and nothing to decide. The caller still seals, because what happens after a
 	// failed model call (a retry, a compaction) is above the loop.
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		// Nothing completed, so there is no turn to prepare from, but the step is over and what it
-		// prepared must not leak into the next one.
-		if (cursor) cursor.prepared = undefined;
+		// The run ends here, as it does in the loop. A retry is a new run and prepares from nothing.
+		if (cursor) clearCursor(cursor);
 		return { messages: [], hasMoreToolCalls: false, continueRequested: false };
+	}
+
+	// The batch is the step's calls in the model's order. A call the caller has no outcome for
+	// can already have its result in the transcript. A seal that ran before and lost its answer
+	// recorded it, and runToolCall() reports nothing for it now. Counting it keeps the decision
+	// the same as the first seal's. The transcript does not keep `terminate`, so such a result
+	// counts as one that asks for another step.
+	const provided = new Map(toolCalls.map((call) => [call.message.toolCallId, call]));
+	const existing = resultsAfter(context.messages, message);
+	const batch: TurnToolCallOutcome[] = [];
+	for (const id of recorded) {
+		const outcome = provided.get(id);
+		const result = existing.get(id);
+		if (outcome) batch.push(outcome);
+		else if (result) batch.push({ message: result, terminate: false });
 	}
 
 	const newMessages: AgentMessage[] = [];
@@ -376,7 +403,7 @@ export async function runAgentSeal(
 		config: stepConfig,
 		newMessages,
 		message,
-		toolCalls,
+		toolCalls: batch,
 		fetchNextPending: false,
 		signal,
 		emit,
@@ -384,15 +411,34 @@ export async function runAgentSeal(
 
 	if (cursor) {
 		// The step is closed, so what it prepared is spent and what it completed is what the next
-		// model call prepares from.
-		cursor.previousTurn = outcome.completedTurn;
-		cursor.prepared = undefined;
+		// model call prepares from. A turn that ended takes the run with it.
+		if (outcome.done) clearCursor(cursor);
+		else {
+			cursor.previousTurn = outcome.completedTurn;
+			cursor.prepared = undefined;
+		}
 	}
 	return {
 		messages: newMessages,
 		hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls,
 		continueRequested: !outcome.done && outcome.continueRequested,
 	};
+}
+
+function clearCursor(cursor: StepCursor): void {
+	cursor.previousTurn = undefined;
+	cursor.prepared = undefined;
+	cursor.runtime = undefined;
+}
+
+/** The results recorded after `message`, by call id. */
+function resultsAfter(messages: ReadonlyArray<AgentMessage>, message: AgentMessage): Map<string, ToolResultMessage> {
+	const results = new Map<string, ToolResultMessage>();
+	for (let index = messages.lastIndexOf(message) + 1; index < messages.length; index++) {
+		const entry = messages[index];
+		if (entry.role === "toolResult") results.set(entry.toolCallId, entry);
+	}
+	return results;
 }
 
 function sameCalls(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
@@ -634,7 +680,8 @@ async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutco
 	// A seal cut short can have recorded some of the results already, so each is checked on its
 	// own. The batch decides the turn either way: dropping a recorded result from the count
 	// would end a turn that has more to do.
-	const recorded = new Set(currentContext.messages.filter((m) => m.role === "toolResult").map((m) => m.toolCallId));
+	// Only this step's results count. Call ids are unique within one response, not across a run.
+	const recorded = resultsAfter(currentContext.messages, message);
 	const toolResults: ToolResultMessage[] = [];
 	for (const call of params.toolCalls) {
 		toolResults.push(call.message);

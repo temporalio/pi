@@ -146,6 +146,7 @@ export type {
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
 	SealStepOptions,
+	SealStepResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,

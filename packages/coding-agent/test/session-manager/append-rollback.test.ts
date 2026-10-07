@@ -12,6 +12,7 @@ const state = vi.hoisted(() => ({
 	// Runs inside a failing append, before it throws, as a stalled write while a newer writer
 	// takes over.
 	duringFailedAppend: undefined as (() => void) | undefined,
+	appends: 0,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -26,6 +27,7 @@ vi.mock("node:fs", async (importOriginal) => {
 			return actual.writeFileSync(...args);
 		}) as typeof actual.writeFileSync,
 		appendFileSync: ((...args: Parameters<typeof actual.appendFileSync>) => {
+			state.appends++;
 			if (state.failNextAppend) {
 				state.failNextAppend = false;
 				const during = state.duringFailedAppend;
@@ -144,5 +146,33 @@ describe("SessionManager: a failed append", () => {
 		state.failNextWrite = true;
 		expect(() => manager.appendMessage(user("one"))).toThrow("disk said no");
 		expect(existsSync(manager.getSessionFile()!)).toBe(true);
+	});
+
+	it("writes a batch with one append, and takes all of it back when that append fails", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+		const lines = () =>
+			readFileSync(manager.getSessionFile()!, "utf8")
+				.split("\n")
+				.filter((l) => l.trim());
+		const before = lines().length;
+
+		state.failNextAppend = true;
+		expect(() =>
+			manager.batch(() => {
+				manager.appendCustomEntry("note", { n: 1 });
+				manager.appendCustomEntry("note", { n: 2 });
+			}),
+		).toThrow("disk said no");
+		expect(manager.getLeafId()).toBe(first);
+		expect(lines().length).toBe(before);
+
+		state.appends = 0;
+		manager.batch(() => {
+			manager.appendCustomEntry("note", { n: 1 });
+			manager.appendCustomEntry("note", { n: 2 });
+		});
+		expect(state.appends).toBe(1);
+		expect(lines().length).toBe(before + 2);
 	});
 });

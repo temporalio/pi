@@ -329,8 +329,55 @@ describe("seal", () => {
 		const mixed = await runAgentSeal(context, config(), results, emit, undefined);
 		expect(mixed.hasMoreToolCalls).toBe(true);
 
-		const stoppingOnly = await runAgentSeal(context, config(), [results[0]], emit, undefined);
+		const alone = scriptedModel([() => createAssistantMessage([toolCall("t3", "stopping")], "toolUse")]);
+		const single = contextWith([createUserMessage("go")], [stopping.tool]);
+		const call = await runAgentModelCall(single, config(), emit, undefined, alone.streamFn);
+		const result = await runAgentToolCall(single, config(), call.toolCalls[0].id, emit, undefined);
+		const stoppingOnly = await runAgentSeal(single, config(), [result as TurnToolCallOutcome], emit, undefined);
 		expect(stoppingOnly.hasMoreToolCalls).toBe(false);
+	});
+
+	it("counts a result an earlier seal recorded, in the order the model asked", async () => {
+		const plain = probeTool({ name: "plain" });
+		const { streamFn } = scriptedModel([
+			() => createAssistantMessage([toolCall("t1", "plain"), toolCall("t2", "plain")], "toolUse"),
+		]);
+		const context = contextWith([createUserMessage("go")], [plain.tool]);
+		const { emit } = collector();
+		await runAgentModelCall(context, config(), emit, undefined, streamFn);
+		const first = (await runAgentToolCall(context, config(), "t1", emit, undefined)) as TurnToolCallOutcome;
+		const second = (await runAgentToolCall(context, config(), "t2", emit, undefined)) as TurnToolCallOutcome;
+
+		// Completion order, not the model's order.
+		const sealed = await runAgentSeal(context, config(), [second, first], emit, undefined, ["t1", "t2"]);
+		expect(recordedFor(context)).toEqual(["t1", "t2"]);
+		expect(sealed.hasMoreToolCalls).toBe(true);
+
+		// The answer was lost. runToolCall() now reports nothing, so the caller has nothing to pass.
+		expect(await runAgentToolCall(context, config(), "t1", emit, undefined)).toBeUndefined();
+		const replayed = await runAgentSeal(context, config(), [], emit, undefined, ["t1", "t2"]);
+		expect(replayed.hasMoreToolCalls).toBe(true);
+		expect(recordedFor(context)).toEqual(["t1", "t2"]);
+	});
+
+	it("does not take a result of an earlier step for one of this step", async () => {
+		const plain = probeTool({ name: "plain" });
+		const { streamFn } = scriptedModel([
+			() => createAssistantMessage([toolCall("t1", "plain")], "toolUse"),
+			() => createAssistantMessage([toolCall("t1", "plain")], "toolUse"),
+		]);
+		const context = contextWith([createUserMessage("go")], [plain.tool]);
+		const { emit } = collector();
+		await runAgentModelCall(context, config(), emit, undefined, streamFn);
+		const first = (await runAgentToolCall(context, config(), "t1", emit, undefined)) as TurnToolCallOutcome;
+		await runAgentSeal(context, config(), [first], emit, undefined);
+
+		// The next response reuses the id, as a provider without ids of its own can.
+		await runAgentModelCall(context, config(), emit, undefined, streamFn);
+		const again = await runAgentToolCall(context, config(), "t1", emit, undefined);
+		expect(again).toBeDefined();
+		await runAgentSeal(context, config(), [again as TurnToolCallOutcome], emit, undefined);
+		expect(recordedFor(context)).toEqual(["t1", "t1"]);
 	});
 });
 
