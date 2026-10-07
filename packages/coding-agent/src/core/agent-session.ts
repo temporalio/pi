@@ -380,6 +380,8 @@ const UNSETTLED_CALLS_MESSAGE = "Tool calls have no result. Call prepareStep() f
 // result otherwise reads as a turn with more to do.
 const TURN_ENDED_ON_RESULT_ENTRY = "pi.turn-ended-on-result";
 const BUILD_BUSY_MESSAGE = "Agent is already processing. Wait for completion before prompting.";
+const COMPACTING_MESSAGE =
+	"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
 
 // ============================================================================
 // AgentSession Class
@@ -1815,9 +1817,11 @@ export class AgentSession {
 
 	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
 	private async _drive(initial: () => Promise<void>): Promise<void> {
-		this._beginTurn();
 		this._isAgentRunActive = true;
+		// Inside the guarded part, because the session can already be held for this turn. A start
+		// that fails has to give it back, or the session stays busy for good.
 		try {
+			this._beginTurn();
 			await initial();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
@@ -2231,9 +2235,7 @@ export class AgentSession {
 		}
 
 		if (this._compactionAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
+			throw new Error(COMPACTING_MESSAGE);
 		}
 
 		// Emit input event for extension interception (before skill/template expansion)
@@ -2326,6 +2328,11 @@ export class AgentSession {
 		// options this would now replace.
 		if (this._isAgentRunActive) {
 			throw new Error(BUILD_BUSY_MESSAGE);
+		}
+		// Compaction and a branch summary rewrite the transcript without holding the session as a
+		// run does, and either can have started during the awaits too.
+		if (this.isCompacting) {
+			throw new Error(COMPACTING_MESSAGE);
 		}
 		// A run that stopped during the awaits can have left calls open.
 		beforeBuild?.();
