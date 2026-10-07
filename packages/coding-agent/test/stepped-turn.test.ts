@@ -24,6 +24,16 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
+/** What the inline test extensions report back, through globals they can reach. */
+const testGlobals = globalThis as typeof globalThis & {
+	reopenedTurnEnds?: number;
+	reopenedContinued?: boolean;
+	reopenedSettles?: number;
+	steppedBeforeSettle?: number;
+	steppedContinued?: boolean;
+	steppedTurnEnds?: number;
+};
+
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
 		super(
@@ -505,7 +515,7 @@ describe("stepped turn", () => {
 		const extension = `export default p => p.on("turn_end", () => {
 			globalThis.steppedTurnEnds = (globalThis.steppedTurnEnds ?? 0) + 1;
 		});`;
-		delete (globalThis as any).steppedTurnEnds;
+		delete testGlobals.steppedTurnEnds;
 		const harness = await createSession("sealed-twice", {
 			responses: [assistant([{ type: "text", text: "answer" }])],
 			extension,
@@ -515,8 +525,8 @@ describe("stepped turn", () => {
 		await harness.session.sealStep([]);
 		await harness.session.sealStep([]);
 
-		expect((globalThis as any).steppedTurnEnds).toBe(1);
-		delete (globalThis as any).steppedTurnEnds;
+		expect(testGlobals.steppedTurnEnds).toBe(1);
+		delete testGlobals.steppedTurnEnds;
 	});
 
 	it("refuses a call or a seal that is late for its step", async () => {
@@ -657,7 +667,7 @@ describe("stepped turn", () => {
 			globalThis.reopenedTurnEnds = (globalThis.reopenedTurnEnds ?? 0) + 1;
 			return { entries: [{ type: "custom", customType: "turn-note", data: {} }] };
 		});`;
-		delete (globalThis as any).reopenedTurnEnds;
+		delete testGlobals.reopenedTurnEnds;
 		const responses = [assistant([{ type: "text", text: "answer" }])];
 		const first = await createSession("sealed-reopened", { responses, extension });
 		await first.session.recordPrompt("go");
@@ -670,8 +680,8 @@ describe("stepped turn", () => {
 		again.session.agent.state.messages = again.sessionManager.buildSessionProjection().messages;
 		await again.session.sealStep([]);
 
-		expect((globalThis as any).reopenedTurnEnds).toBe(1);
-		delete (globalThis as any).reopenedTurnEnds;
+		expect(testGlobals.reopenedTurnEnds).toBe(1);
+		delete testGlobals.reopenedTurnEnds;
 		const notes = SessionManager.open(file)
 			.getBranch()
 			.filter((entry) => entry.type === "custom" && entry.customType === "turn-note");
@@ -683,7 +693,7 @@ describe("stepped turn", () => {
 			globalThis.reopenedSettles = (globalThis.reopenedSettles ?? 0) + 1;
 			return { entries: [{ type: "custom", customType: "settle-note", data: {} }] };
 		});`;
-		delete (globalThis as any).reopenedSettles;
+		delete testGlobals.reopenedSettles;
 		const responses = [assistant([{ type: "text", text: "answer" }])];
 		const first = await createSession("settled-reopened", { responses, extension });
 		await first.session.recordPrompt("go");
@@ -693,8 +703,8 @@ describe("stepped turn", () => {
 		const again = await reopen(first, "settled-reopened-again", { responses, extension });
 		expect((await again.session.sealStep([])).done).toBe(true);
 
-		expect((globalThis as any).reopenedSettles).toBe(1);
-		delete (globalThis as any).reopenedSettles;
+		expect(testGlobals.reopenedSettles).toBe(1);
+		delete testGlobals.reopenedSettles;
 		const notes = SessionManager.open(first.sessionManager.getSessionFile()!)
 			.getBranch()
 			.filter((entry) => entry.type === "custom" && entry.customType === "settle-note");
@@ -713,8 +723,8 @@ describe("stepped turn", () => {
 				globalThis.reopenedSettles = (globalThis.reopenedSettles ?? 0) + 1;
 			});
 		};`;
-		delete (globalThis as any).reopenedContinued;
-		delete (globalThis as any).reopenedSettles;
+		delete testGlobals.reopenedContinued;
+		delete testGlobals.reopenedSettles;
 		const responses = [assistant([{ type: "text", text: "first" }])];
 		const first = await createSession("continued", { responses, extension });
 		await first.session.recordPrompt("go");
@@ -726,9 +736,9 @@ describe("stepped turn", () => {
 
 		// Ending here would leave the message the boundary committed unanswered.
 		expect(done).toBe(false);
-		expect((globalThis as any).reopenedSettles).toBeUndefined();
-		delete (globalThis as any).reopenedContinued;
-		delete (globalThis as any).reopenedSettles;
+		expect(testGlobals.reopenedSettles).toBeUndefined();
+		delete testGlobals.reopenedContinued;
+		delete testGlobals.reopenedSettles;
 	});
 
 	async function driveAnswers(name: string, extension: string): Promise<{ harness: Harness; seals: boolean[] }> {
@@ -759,7 +769,7 @@ describe("stepped turn", () => {
 				};
 			});`,
 		);
-		delete (globalThis as any).steppedContinued;
+		delete testGlobals.steppedContinued;
 
 		expect(seals).toEqual([false, true]);
 		expect(harness.asked()).toBe(2);
@@ -775,7 +785,7 @@ describe("stepped turn", () => {
 				return { continue: true };
 			});`,
 		);
-		delete (globalThis as any).steppedContinued;
+		delete testGlobals.steppedContinued;
 
 		expect(seals).toEqual([true]);
 		expect(harness.asked()).toBe(1);
@@ -789,8 +799,8 @@ describe("stepped turn", () => {
 				return { continue: true };
 			});`,
 		);
-		const emitted = (globalThis as any).steppedBeforeSettle;
-		delete (globalThis as any).steppedBeforeSettle;
+		const emitted = testGlobals.steppedBeforeSettle;
+		delete testGlobals.steppedBeforeSettle;
 
 		expect(emitted).toBe(1);
 		expect(seals).toEqual([true]);
@@ -803,14 +813,16 @@ describe("stepped turn", () => {
 		const responses = [failed, assistant([{ type: "text", text: "answer" }])];
 		const first = await createSession("lost-retry", { responses, fastRetry: true });
 		await first.session.recordPrompt("go");
-		await first.session.modelCall();
-		const decided = await first.session.sealStep([], { retryAttempt: 0 });
+		const { stepId } = await first.session.modelCall();
+		const decided = await first.session.sealStep([], { retryAttempt: 0, stepId });
 		expect(decided).toMatchObject({ done: false, retryAttempt: 1 });
 
 		// The failed response is out of the model's context, so there is no step left to seal.
 		// The driver still holds the count it had before the lost answer.
 		const again = await reopen(first, "lost-retry-again", { responses, fastRetry: true });
-		expect(await again.session.sealStep([], { retryAttempt: 0 })).toEqual(decided);
+		expect(await again.session.sealStep([], { retryAttempt: 0, stepId })).toEqual(decided);
+		// A caller late for another step is refused, not handed this step's decision.
+		await expect(again.session.sealStep([], { retryAttempt: 0, stepId: "older" })).rejects.toThrow("is over");
 	});
 
 	it("is busy while a reopened session runs a tool call", async () => {

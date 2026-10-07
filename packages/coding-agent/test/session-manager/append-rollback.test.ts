@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
 	// takes over.
 	duringFailedAppend: undefined as (() => void) | undefined,
 	appends: 0,
+	writes: 0,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -20,6 +21,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	return {
 		...actual,
 		writeFileSync: ((...args: Parameters<typeof actual.writeFileSync>) => {
+			state.writes++;
 			if (state.failNextWrite) {
 				state.failNextWrite = false;
 				throw new Error("disk said no");
@@ -82,6 +84,22 @@ describe("SessionManager: a failed append", () => {
 			.filter((entry) => entry.type === "message");
 		expect(entries.map((entry) => entry.id)).toEqual([first, second]);
 		expect(entries[1].parentId).toBe(first);
+	});
+
+	it("writes the first entries of a session in one write", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		manager.appendCustomEntry("setup", { n: 1 });
+		manager.appendCustomEntry("setup", { n: 2 });
+
+		// Setup entries wait for the conversation, then go to the file together.
+		state.writes = 0;
+		manager.appendMessage(user("one"));
+		expect(state.writes).toBe(1);
+		expect(
+			readFileSync(manager.getSessionFile()!, "utf8")
+				.split("\n")
+				.filter((l) => l.trim()),
+		).toHaveLength(4);
 	});
 
 	it("removes a first write that failed part way, so the session can still be written", () => {
