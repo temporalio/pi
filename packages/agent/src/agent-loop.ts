@@ -389,11 +389,15 @@ export async function runAgentSeal(
 	const provided = new Map(toolCalls.map((call) => [call.message.toolCallId, call]));
 	const existing = resultsAfter(context.messages, message);
 	const batch: TurnToolCallOutcome[] = [];
-	for (const id of recorded) {
-		const outcome = provided.get(id);
-		const result = existing.get(id);
+	for (const call of message.content) {
+		if (call.type !== "toolCall") continue;
+		const outcome = provided.get(call.id);
+		const result = existing.get(call.id);
 		if (outcome) batch.push(outcome);
 		else if (result) batch.push({ message: result, terminate: false });
+		// Nobody can say whether a call with neither ran. The step still closes, and the model is
+		// told the outcome is unknown, so the turn never ends with a call that has no result.
+		else batch.push(unknownToolCallOutcome(call));
 	}
 
 	const newMessages: AgentMessage[] = [];

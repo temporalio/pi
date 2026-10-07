@@ -148,6 +148,16 @@ describe("SessionManager: a failed append", () => {
 		expect(existsSync(manager.getSessionFile()!)).toBe(true);
 	});
 
+	it("takes a label back too when its batch fails", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+
+		state.failNextAppend = true;
+		expect(() => manager.batch(() => manager.appendLabelChange(first, "kept?"))).toThrow("disk said no");
+		expect(manager.getLabel(first)).toBeUndefined();
+		expect(manager.getLeafId()).toBe(first);
+	});
+
 	it("writes a batch with one append, and takes all of it back when that append fails", () => {
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
 		const first = manager.appendMessage(user("one"));

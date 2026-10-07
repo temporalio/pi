@@ -337,6 +337,24 @@ describe("seal", () => {
 		expect(stoppingOnly.hasMoreToolCalls).toBe(false);
 	});
 
+	it("gives a call with no outcome and no recorded result an unknown one", async () => {
+		const plain = probeTool({ name: "plain" });
+		const { streamFn } = scriptedModel([
+			() => createAssistantMessage([toolCall("t1", "plain"), toolCall("t2", "plain")], "toolUse"),
+		]);
+		const context = contextWith([createUserMessage("go")], [plain.tool]);
+		const { emit } = collector();
+		await runAgentModelCall(context, config(), emit, undefined, streamFn);
+		const first = (await runAgentToolCall(context, config(), "t1", emit, undefined)) as TurnToolCallOutcome;
+
+		// The turn must not end with a call that has no result.
+		const sealed = await runAgentSeal(context, config(), [first], emit, undefined, ["t1", "t2"]);
+		expect(recordedFor(context)).toEqual(["t1", "t2"]);
+		expect(sealed.hasMoreToolCalls).toBe(true);
+		const unknown = context.messages.find((m) => m.role === "toolResult" && m.toolCallId === "t2");
+		expect(unknown?.role === "toolResult" && unknown.isError).toBe(true);
+	});
+
 	it("counts a result an earlier seal recorded, in the order the model asked", async () => {
 		const plain = probeTool({ name: "plain" });
 		const { streamFn } = scriptedModel([

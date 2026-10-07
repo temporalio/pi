@@ -519,6 +519,40 @@ describe("stepped turn", () => {
 		delete (globalThis as any).steppedTurnEnds;
 	});
 
+	it("refuses a seal while a tool call of the step is running", async () => {
+		const harness = await createSession("seal-during-tool");
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		let settled = 0;
+		let attempt: Promise<unknown> | undefined;
+		harness.session.subscribe((event) => {
+			if (event.type === "agent_settled") settled++;
+			if (event.type === "tool_execution_start") attempt = harness.session.sealStep([]);
+		});
+		const result = await harness.session.runToolCall("call_1");
+
+		await expect(attempt).rejects.toThrow("already processing");
+		// The refused seal didn't settle the run under the running call.
+		expect(settled).toBe(0);
+		expect(result).toBeDefined();
+	});
+
+	it("replays what turn_end decided when its handler took the response out of the context", async () => {
+		const extension = `export default p => p.on("turn_end", (event) => ({
+			entries: [{ type: "context_edit", targetId: event.messageEntryId, replacement: null }],
+		}));`;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("omitted-by-hook", { responses, extension });
+		await first.session.recordPrompt("go");
+		await first.session.modelCall();
+		const sealed = await first.session.sealStep([]);
+
+		// Not a recovery. The replay must not ask for another model call.
+		const again = await reopen(first, "omitted-by-hook-again", { responses, extension });
+		expect(await again.session.sealStep([])).toEqual(sealed);
+		expect(again.asked()).toBe(0);
+	});
+
 	it("keeps a turn its tools stopped over when the seal runs again in a reopened session", async () => {
 		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
 		const responses = [assistant([call], "toolUse"), assistant([{ type: "text", text: "never" }])];
