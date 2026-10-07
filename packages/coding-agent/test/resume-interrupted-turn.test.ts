@@ -514,6 +514,62 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(roles).toEqual(["user", "assistant", "toolResult", "toolResult", "custom"]);
 	});
 
+	it("resumes a flush that failed at the first message it did not write", async () => {
+		await createSession();
+		seed([user("go"), answer("done")]);
+		const custom = (text: string): CustomMessage => ({ ...note(text), display: false });
+		const bash = (command: string) => ({
+			role: "bashExecution" as const,
+			command,
+			output: "",
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			timestamp: Date.now(),
+		});
+		const internals = session as unknown as {
+			_pendingCustomMessages: CustomMessage[];
+			_pendingBashMessages: ReturnType<typeof bash>[];
+			_flushPendingCustomMessages(): void;
+			_flushPendingBashMessages(): void;
+		};
+		internals._pendingCustomMessages = [custom("a"), custom("b")];
+		internals._pendingBashMessages = [bash("one"), bash("two")];
+
+		const appendCustom = sessionManager.appendCustomMessageEntry.bind(sessionManager);
+		const appendMessage = sessionManager.appendMessage.bind(sessionManager);
+		let failCustom = true;
+		let failBash = true;
+		sessionManager.appendCustomMessageEntry = ((...args: Parameters<typeof appendCustom>) => {
+			if (failCustom && contentText(args[1] as never, "") === "b") {
+				failCustom = false;
+				throw new Error("disk said no");
+			}
+			return appendCustom(...args);
+		}) as typeof appendCustom;
+		sessionManager.appendMessage = ((message: AgentMessage) => {
+			if (failBash && message.role === "bashExecution" && message.command === "two") {
+				failBash = false;
+				throw new Error("disk said no");
+			}
+			return appendMessage(message as never);
+		}) as typeof appendMessage;
+
+		expect(() => internals._flushPendingCustomMessages()).toThrow("disk said no");
+		expect(() => internals._flushPendingBashMessages()).toThrow("disk said no");
+		internals._flushPendingCustomMessages();
+		internals._flushPendingBashMessages();
+
+		// Each queued message is in the file once, in order.
+		const entries = sessionManager.getBranch();
+		const notes = entries.flatMap((e) => (e.type === "custom_message" ? [contentText(e.content as never, "")] : []));
+		const commands = entries.flatMap((e) =>
+			e.type === "message" && e.message.role === "bashExecution" ? [e.message.command] : [],
+		);
+		expect(notes).toEqual(["a", "b"]);
+		expect(commands).toEqual(["one", "two"]);
+	});
+
 	it("runs a second prompt's hooks only if its build gets the session", async () => {
 		let release = () => {};
 		const held = new Promise<void>((resolve) => {
