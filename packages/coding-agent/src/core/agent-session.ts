@@ -22,7 +22,6 @@ import {
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
-	type AgentModelCallOutcome,
 	type AgentState,
 	type AgentStepOutcome,
 	type AgentTool,
@@ -108,6 +107,8 @@ import {
 	type SessionCompactFailedEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
+	type StepCallOptions,
+	type SteppedModelCall,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -2005,8 +2006,11 @@ export class AgentSession {
 		const steps: TurnSteps = {
 			record,
 			interrupted: () => this.agent.interrupted,
-			modelCall: () => this.agent.modelCall(),
-			runToolCall: (toolCallId) => this.agent.runToolCall(toolCallId),
+			modelCall: async () => ({ ...(await this.agent.modelCall()), stepId: this._currentStepId() }),
+			runToolCall: async (toolCallId, options) => {
+				this._refuseStaleStep(options?.stepId, `run call ${toolCallId}`);
+				return this.agent.runToolCall(toolCallId);
+			},
 			// The run window is `_drive`'s, so the seal here decides and does not settle the run.
 			sealStep: (results, options) => this._sealStep(results, options),
 		};
@@ -2037,6 +2041,8 @@ export class AgentSession {
 	private _beginTurn(): void {
 		this._agentRunAbortRequested = false;
 		this._runFinalResponse = undefined;
+		// The loop resets this on agent_start, which a stepped turn never emits.
+		this._turnIndex = 0;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
@@ -2052,18 +2058,35 @@ export class AgentSession {
 	 * see _restoreTurnPromptOptions().
 	 */
 	private async _settleRun(turnDone = true): Promise<void> {
-		if (turnDone) {
-			this._runSystemPromptOptions = undefined;
-			// In the file too. A session reopened later restores the latest recorded options, and
-			// work after a finished turn belongs to the session's own options, not to that turn's.
-			const recorded = this._recordedPromptOptionChanges();
-			if (recorded && Object.keys(recorded).length > 0) {
-				this._appendInternalEntry(TURN_PROMPT_OPTIONS_ENTRY, { changes: {} });
+		// The writes here can fail, a refused write guard included. The run ends either way, or the
+		// session stays busy for good.
+		try {
+			if (turnDone) {
+				this._runSystemPromptOptions = undefined;
+				// In the file too. A session reopened later restores the latest recorded options, and
+				// work after a finished turn belongs to the session's own options, not to that turn's.
+				const recorded = this._recordedPromptOptionChanges();
+				if (recorded && Object.keys(recorded).length > 0) {
+					this._appendInternalEntry(TURN_PROMPT_OPTIONS_ENTRY, { changes: {} });
+				}
 			}
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+		} finally {
+			await this._emitAgentSettled();
 		}
-		this._flushPendingBashMessages();
-		this._flushPendingCustomMessages();
-		await this._emitAgentSettled();
+	}
+
+	/** The persisted entry of the step's response, which names the step across processes. */
+	private _currentStepId(): string | undefined {
+		const last = this._findLastAssistantMessage();
+		return last ? this._findPersistedMessageEntryId(last) : undefined;
+	}
+
+	/** Refuse a caller whose step is over. Its call id can name a call of the next step. */
+	private _refuseStaleStep(stepId: string | undefined, what: string): void {
+		if (stepId === undefined || stepId === this._currentStepId()) return;
+		throw new Error(`Cannot ${what}: step ${stepId} is over`);
 	}
 
 	/** Write down what this turn changed in the prompt options, unless the file already says so. */
@@ -2313,7 +2336,7 @@ export class AgentSession {
 	 * three. A response the transcript already holds is reported again without a model call,
 	 * which is the answer a caller that lost its record of the call gets back.
 	 */
-	async modelCall(): Promise<AgentModelCallOutcome> {
+	async modelCall(): Promise<SteppedModelCall> {
 		if (this._isAgentRunActive) {
 			// Not "the response ended the run". A caller told that seals a step it never opened,
 			// which closes the previous one a second time.
@@ -2324,7 +2347,8 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		this._restoreTurnPromptOptions();
 		try {
-			return await this.agent.modelCall();
+			const outcome = await this.agent.modelCall();
+			return { ...outcome, stepId: this._currentStepId() };
 		} catch (error) {
 			// The step never opened, so nothing is left to seal and the run must not stay marked
 			// as active.
@@ -2340,7 +2364,8 @@ export class AgentSession {
 	 *
 	 * Undefined means the transcript already held a result for the call, so nothing ran.
 	 */
-	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+	async runToolCall(toolCallId: string, options: StepCallOptions = {}): Promise<TurnToolCallOutcome | undefined> {
+		this._refuseStaleStep(options.stepId, `run call ${toolCallId}`);
 		// A tool can read the system prompt, and this can be the first thing a process does.
 		const restored = this._runSystemPromptOptions === undefined;
 		this._restoreTurnPromptOptions();
@@ -2378,7 +2403,8 @@ export class AgentSession {
 		// Busy until the seal settles, also when this process did not open the step, so a prompt
 		// sent while turn_end handlers run queues instead of being refused.
 		this._isAgentRunActive = true;
-		let done = true;
+		// A seal that throws leaves its step open, so the turn's state stays for the next try.
+		let done = false;
 		try {
 			const sealed = await this._sealStep(toolCalls, options);
 			done = sealed.done;
@@ -2403,6 +2429,7 @@ export class AgentSession {
 		if (tail?.role === "toolResult" && this._turnEndedOn(tail)) {
 			return { done: true, retryAttempt: 0, overflowRecoveryAttempted: false };
 		}
+		this._refuseStaleStep(options.stepId, "seal");
 		this._sealingStep = true;
 		let outcome: AgentStepOutcome;
 		try {

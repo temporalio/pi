@@ -519,6 +519,62 @@ describe("stepped turn", () => {
 		delete (globalThis as any).steppedTurnEnds;
 	});
 
+	it("refuses a call or a seal that is late for its step", async () => {
+		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
+		const reused = { ...call, arguments: { q: "two" } };
+		const responses = [assistant([call], "toolUse"), assistant([reused], "toolUse")];
+		const harness = await createSession("late-for-step", { responses });
+		await harness.session.recordPrompt("go");
+		const first = await harness.session.modelCall();
+		const result = await harness.session.runToolCall("call_1", { stepId: first.stepId });
+		await harness.session.sealStep(result ? [result] : [], { stepId: first.stepId });
+
+		// The next response reuses the call id with other arguments.
+		const second = await harness.session.modelCall();
+		expect(second.stepId).not.toBe(first.stepId);
+		await expect(harness.session.runToolCall("call_1", { stepId: first.stepId })).rejects.toThrow("is over");
+		await expect(harness.session.sealStep([], { stepId: first.stepId })).rejects.toThrow("is over");
+		expect(harness.ran).toEqual(["one"]);
+
+		// A rejected seal leaves the step open, so the right caller still closes it.
+		const ran = await harness.session.runToolCall("call_1", { stepId: second.stepId });
+		expect((await harness.session.sealStep(ran ? [ran] : [], { stepId: second.stepId })).done).toBe(false);
+		expect(harness.ran).toEqual(["one", "two"]);
+	});
+
+	it("frees the session when a write at the end of a turn fails", async () => {
+		const harness = await createSession("settle-write-fails", {
+			responses: [assistant([{ type: "text", text: "answer" }])],
+		});
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const internals = harness.session as unknown as {
+			_recordedPromptOptionChanges(): Record<string, unknown>;
+			_appendInternalEntry(customType: string, data: unknown): void;
+		};
+		internals._recordedPromptOptionChanges = () => ({ sections: {} });
+		internals._appendInternalEntry = () => {
+			throw new Error("not ours to write");
+		};
+
+		await expect(harness.session.sealStep([])).rejects.toThrow("not ours to write");
+		expect(harness.session.isIdle).toBe(true);
+	});
+
+	it("keeps the turn's options when a seal is refused", async () => {
+		const harness = await createSession("refused-seal");
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const internals = harness.session as unknown as { _runSystemPromptOptions: unknown };
+		const options = { cwd: "/kept" };
+		internals._runSystemPromptOptions = options;
+
+		await expect(harness.session.sealStep([], { expectCalls: ["other"] })).rejects.toThrow("Cannot seal");
+		// The step is still open, and a refused seal is not the end of its turn.
+		expect(internals._runSystemPromptOptions).toBe(options);
+		expect(harness.session.isIdle).toBe(true);
+	});
+
 	it("refuses a seal while a tool call of the step is running", async () => {
 		const harness = await createSession("seal-during-tool");
 		await harness.session.recordPrompt("go");

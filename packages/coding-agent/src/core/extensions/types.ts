@@ -1537,13 +1537,29 @@ export interface TurnSteps {
 	 * a driver has more units after it, so it has to stop asking for them itself.
 	 */
 	interrupted(): boolean;
-	modelCall(): Promise<AgentModelCallOutcome>;
+	modelCall(): Promise<SteppedModelCall>;
 	/** Undefined when the transcript already held a result for the call, so nothing ran. */
-	runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined>;
+	runToolCall(toolCallId: string, options?: StepCallOptions): Promise<TurnToolCallOutcome | undefined>;
 	sealStep(results: ReadonlyArray<TurnToolCallOutcome>, options?: SealStepOptions): Promise<SealStepResult>;
 }
 
-export interface SealStepOptions {
+/** A model call's outcome, with the step it opened. */
+export interface SteppedModelCall extends AgentModelCallOutcome {
+	/**
+	 * Names the step this call opened, across processes. A call id is unique only within one
+	 * response, and a provider can reuse one in the next step. Pass this back to `runToolCall()`
+	 * and `sealStep()`, and a caller that is late for its step is refused instead of running the
+	 * next step's call.
+	 */
+	stepId?: string;
+}
+
+export interface StepCallOptions {
+	/** The `stepId` the model call returned. The call is refused once its step is over. */
+	stepId?: string;
+}
+
+export interface SealStepOptions extends StepCallOptions {
 	/** The ids of the calls the step being closed asked for. On a durable driver the model call and
 	 * the seal are separate units of work, and this refuses a seal that would close a different one. */
 	expectCalls?: ReadonlyArray<string>;
