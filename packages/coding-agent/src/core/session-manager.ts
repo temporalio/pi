@@ -1238,9 +1238,8 @@ export class SessionManager {
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				try {
-					for (const e of this.fileEntries) {
-						writeFileSync(fd, `${JSON.stringify(e)}\n`);
-					}
+					// One write, so a process that dies here leaves no part of the first entries behind.
+					writeFileSync(fd, this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join(""));
 				} finally {
 					closeSync(fd);
 				}

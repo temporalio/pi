@@ -1926,6 +1926,7 @@ export class AgentSession {
 	 */
 	private async _drive(initial: () => Promise<void>, record: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
+		let finished = false;
 		const run = async () => {
 			// An executor can hold the turn and call this after the user stopped it. The agent has
 			// no run to abort until this starts one, and starting one clears its stop.
@@ -1974,10 +1975,13 @@ export class AgentSession {
 			} else {
 				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run, steps });
 			}
+			finished = !this._agentRunAbortRequested;
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
-			await this._settleRun();
+			// A stopped or failed turn still has work, and a resumed run needs the options it was
+			// built with. Only a turn that ran to its end gives them up.
+			await this._settleRun(finished);
 		}
 	}
 
@@ -2360,11 +2364,11 @@ export class AgentSession {
 		if (replayed) return replayed;
 		// A seal that already ended the turn because its tools asked it to stop. The transcript
 		// does not keep `terminate`, so sealing again would read the results as asking for more.
+		this._refuseStaleStep(options.stepId, "seal");
 		const tail = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
 		if (tail?.role === "toolResult" && this._turnEndedOn(tail)) {
 			return { done: true, retryAttempt: 0, overflowRecoveryAttempted: false };
 		}
-		this._refuseStaleStep(options.stepId, "seal");
 		this._sealingStep = true;
 		let outcome: AgentStepOutcome;
 		try {
@@ -2393,6 +2397,11 @@ export class AgentSession {
 	private _replayRecoverySeal(options: SealStepOptions): SealStepResult | undefined {
 		const found = this._findOmittedStepResponse();
 		if (!found) return undefined;
+		// The omitted response names its step. A caller late for an older step is refused here too,
+		// not handed this step's decision.
+		if (options.stepId !== undefined && options.stepId !== found.entryId) {
+			throw new Error(`Cannot seal: step ${options.stepId} is over`);
+		}
 		const carried = options.retryAttempt ?? 0;
 		if (!found.recovery) {
 			// A turn_end handler took the response out, not a recovery. The seal that ran recorded
@@ -2422,7 +2431,7 @@ export class AgentSession {
 	 * edit goes in before it, in the same write. So the order in the file says which one it was.
 	 */
 	private _findOmittedStepResponse():
-		| { message: AssistantMessage; recovery: boolean; dispatch?: TurnEndDispatch }
+		| { message: AssistantMessage; entryId: string; recovery: boolean; dispatch?: TurnEndDispatch }
 		| undefined {
 		const omitted = new Set<string>();
 		const byRecovery = new Set<string>();
@@ -2447,6 +2456,7 @@ export class AgentSession {
 			if (entry.message.role === "assistant") {
 				return {
 					message: entry.message,
+					entryId: entry.id,
 					recovery: byRecovery.has(entry.id),
 					dispatch: dispatches.get(entry.id),
 				};

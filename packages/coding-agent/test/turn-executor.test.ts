@@ -14,6 +14,12 @@ import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
+/** What the inline test extensions report back, through globals they can reach. */
+const testGlobals = globalThis as typeof globalThis & {
+	turnsSeen?: unknown;
+	releaseTurn?: () => void;
+};
+
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor() {
 		super(
@@ -69,13 +75,13 @@ describe("turn executor", () => {
 		extensionsDir = path.join(tempDir, "extensions");
 		fs.mkdirSync(extensionsDir);
 		modelCalls = 0;
-		delete (globalThis as any).turnsSeen;
+		delete testGlobals.turnsSeen;
 	});
 
 	afterEach(() => {
 		if (session) session.dispose();
 		session = undefined;
-		delete (globalThis as any).turnsSeen;
+		delete testGlobals.turnsSeen;
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -140,7 +146,7 @@ describe("turn executor", () => {
 		const registered = runner.getTurnExecutor();
 		expect(registered).toBeDefined();
 		await registered?.executor({ sessionId: "s", run: async () => {}, steps: noSteps });
-		expect((globalThis as any).turnsSeen).toBe("first");
+		expect(testGlobals.turnsSeen).toBe("first");
 	});
 
 	it("runs the same turn through the executor as without one", async () => {
@@ -155,7 +161,7 @@ describe("turn executor", () => {
 		await (session as AgentSession).waitForIdle();
 
 		// The executor was handed the turn, once, with the session it belongs to.
-		const seen = (globalThis as any).turnsSeen as string[];
+		const seen = testGlobals.turnsSeen as string[];
 		expect(seen.length).toBe(1);
 		expect(seen[0]).toBe((session as AgentSession).sessionManager.getSessionId());
 
@@ -192,7 +198,7 @@ describe("turn executor", () => {
 
 		// One step, and the same turn as the one pi would have run: the prompt reached the
 		// transcript without a model call of its own, and the answer is where run() leaves it.
-		expect((globalThis as any).turnsSeen).toEqual(["step"]);
+		expect(testGlobals.turnsSeen).toEqual(["step"]);
 		expect(modelCalls).toBe(1);
 		const messages = (session as AgentSession).agent.state.messages;
 		expect(messages.filter((m) => m.role !== "system").map((m) => m.role)).toEqual(["user", "assistant"]);
@@ -225,7 +231,7 @@ describe("turn executor", () => {
 		await s.bindExtensions({});
 		await s.waitForIdle();
 
-		expect((globalThis as any).turnsSeen).toEqual(["resume"]);
+		expect(testGlobals.turnsSeen).toEqual(["resume"]);
 		// The dangling call was settled and the turn ran on to an answer, without a second prompt.
 		const messages = s.agent.state.messages;
 		expect(messages.filter((m) => m.role === "user").length).toBe(1);
@@ -257,8 +263,26 @@ describe("turn executor", () => {
 
 		await s.bindExtensions({});
 
-		expect((globalThis as any).turnsSeen).toBeUndefined();
+		expect(testGlobals.turnsSeen).toBeUndefined();
 		expect(modelCalls).toBe(0);
+	});
+
+	it("keeps the turn's prompt options when an executor fails part way", async () => {
+		await createSession(
+			`export default p => {
+				p.on("before_agent_start", () => ({ systemPrompt: "Exact prompt." }));
+				p.registerTurnExecutor(async () => { throw new Error("worker gone"); });
+			}`,
+		);
+		await expect(session!.prompt("go")).rejects.toThrow("worker gone");
+
+		// The turn didn't finish, so a resumed run still needs the options it was built with.
+		const recorded = session!.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "pi.turn-prompt-options")
+			.map((entry) => (entry.type === "custom" ? (entry.data as { changes: object }).changes : {}));
+		expect(recorded.length).toBeGreaterThan(0);
+		expect(Object.keys(recorded.at(-1) ?? {})).not.toHaveLength(0);
 	});
 
 	it("does not run a turn the user stopped while the executor held it", async () => {
@@ -270,14 +294,14 @@ describe("turn executor", () => {
 			});`,
 		);
 		const prompted = session!.prompt("go");
-		await vi.waitFor(() => expect((globalThis as any).releaseTurn).toBeDefined());
+		await vi.waitFor(() => expect(testGlobals.releaseTurn).toBeDefined());
 
 		const stopped = session!.abort();
-		(globalThis as any).releaseTurn();
+		testGlobals.releaseTurn?.();
 		await Promise.all([stopped, prompted]);
 
 		expect(modelCalls).toBe(0);
-		delete (globalThis as any).releaseTurn;
+		delete testGlobals.releaseTurn;
 	});
 
 	it("leaves the turn unrun when the executor never runs it", async () => {
@@ -288,7 +312,7 @@ describe("turn executor", () => {
 		await (session as AgentSession).prompt("go");
 
 		// Holding a turn holds the whole turn, prompt included: run() is what records it.
-		expect((globalThis as any).turnsSeen).toBe("held");
+		expect(testGlobals.turnsSeen).toBe("held");
 		expect(modelCalls).toBe(0);
 		expect((session as AgentSession).agent.state.messages.filter((m) => m.role !== "system")).toEqual([]);
 	});
