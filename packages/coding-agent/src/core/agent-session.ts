@@ -2075,7 +2075,15 @@ export class AgentSession {
 	 * mark in the text and checks the transcript tail for it.
 	 */
 	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
-		const messages = await this._buildPromptMessages(text, options);
+		// Refused before the build takes anything, so a rejected prompt leaves the queued
+		// messages and the prompt options as they were. It runs after commands and queueing,
+		// because a live run's in-flight call is not a dangling one.
+		const refuseUnsettled = () => {
+			if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
+				throw new Error(UNSETTLED_CALLS_MESSAGE);
+			}
+		};
+		const messages = await this._buildPromptMessages(text, options, refuseUnsettled);
 		if (!messages) {
 			return false;
 		}
@@ -2086,11 +2094,10 @@ export class AgentSession {
 		if (this._isAgentRunActive) {
 			throw new Error(BUILD_BUSY_MESSAGE);
 		}
-		// Checked only on a stopped transcript, after commands and queueing had their chance: a
-		// live run's in-flight call is not a dangling one, and an extension command never appends.
-		if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
-			throw new Error(UNSETTLED_CALLS_MESSAGE);
-		}
+		// Again, for a run that stopped during the build's awaits and left calls open. That is
+		// rare, and the build has taken its inputs by now, but a prompt between a call and its
+		// result is worse.
+		refuseUnsettled();
 
 		options?.preflightResult?.("started");
 		this._beginTurn();
@@ -2117,7 +2124,15 @@ export class AgentSession {
 	 * All of prompt() except the running of it. Returns the turn's messages, or undefined
 	 * when the text needed no run at all.
 	 */
-	private async _buildPromptMessages(text: string, options?: PromptOptions): Promise<AgentMessage[] | undefined> {
+	/**
+	 * `beforeBuild` runs once the text is known to start a new turn, before anything is taken from
+	 * the queues or the prompt options change, so a caller can still refuse without side effects.
+	 */
+	private async _buildPromptMessages(
+		text: string,
+		options?: PromptOptions,
+		beforeBuild?: () => void,
+	): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -2172,6 +2187,8 @@ export class AgentSession {
 			preflightResult?.("queued");
 			return;
 		}
+
+		beforeBuild?.();
 
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();

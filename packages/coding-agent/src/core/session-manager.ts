@@ -21,6 +21,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	rmSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -1229,11 +1230,18 @@ export class SessionManager {
 			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				try {
+					for (const e of this.fileEntries) {
+						writeFileSync(fd, `${JSON.stringify(e)}\n`);
+					}
+				} finally {
+					closeSync(fd);
 				}
-			} finally {
-				closeSync(fd);
+			} catch (error) {
+				// This call created the file, so a part of it is ours to remove. Left in place, it
+				// makes every retry fail to create the file, and the session can never be written.
+				rmSync(this.sessionFile, { force: true });
+				throw error;
 			}
 			this.flushed = true;
 		} else {

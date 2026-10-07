@@ -373,12 +373,22 @@ describe("AgentSession: settling an interrupted turn", () => {
 		await createSession();
 		seed([user("go"), assistant([call("hang-1")], "toolUse")]);
 
+		await session.sendCustomMessage(
+			{ customType: "note", content: "context", display: false },
+			{
+				deliverAs: "nextTurn",
+			},
+		);
+
 		await expect(session.recordPrompt("next")).rejects.toThrow("Call prepareStep() first");
 		expect(session.agent.state.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
 
 		expect(session.prepareStep()).toBe(true);
 		expect(await session.recordPrompt("next")).toBe(true);
 		assertValidToolPairing(session.agent.state.messages);
+		// The refusal took nothing, so the queued message still goes in with the prompt.
+		const notes = session.agent.state.messages.filter((m) => m.role === "custom" && m.customType === "note");
+		expect(notes).toHaveLength(1);
 	});
 
 	it("queues a recording sent mid-run instead of rejecting it", async () => {
