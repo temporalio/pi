@@ -404,6 +404,8 @@ function promptOptionChanges(
 
 // Names the message entry of a stepped turn whose `turn_end` boundary was dispatched.
 const TURN_END_DISPATCHED_ENTRY = "pi.turn-end-dispatched";
+// Names the last message entry of a stepped turn whose `agent_before_settle` boundary ran.
+const SETTLE_DISPATCHED_ENTRY = "pi.before-settle-dispatched";
 
 interface TurnEndDispatch {
 	messageEntryId: string;
@@ -975,14 +977,22 @@ export class AgentSession {
 
 	/** What the file says `turn_end` decided for the turn that `message` opened, if it ran. */
 	private _findTurnEndDispatch(message: AssistantMessage): TurnEndDispatch | undefined {
+		return this._findDispatch<TurnEndDispatch>(TURN_END_DISPATCHED_ENTRY, message);
+	}
+
+	/** The marker of `customType` that names `message`, if one was written after it. */
+	private _findDispatch<T extends { messageEntryId: string }>(
+		customType: string,
+		message: AgentMessage,
+	): T | undefined {
 		const messageEntryId = this._findPersistedMessageEntryId(message);
 		if (!messageEntryId) return undefined;
 		const branch = this.sessionManager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
 			if (entry.id === messageEntryId) return undefined;
-			if (entry.type !== "custom" || entry.customType !== TURN_END_DISPATCHED_ENTRY) continue;
-			const dispatch = entry.data as TurnEndDispatch | undefined;
+			if (entry.type !== "custom" || entry.customType !== customType) continue;
+			const dispatch = entry.data as T | undefined;
 			if (dispatch?.messageEntryId === messageEntryId) return dispatch;
 		}
 		return undefined;
@@ -1141,6 +1151,22 @@ export class AgentSession {
 					? this.agent.hasQueuedMessages()
 					: finalRole === "assistant" && this.agent.hasQueuedMessages()),
 		};
+	}
+
+	/** Commit the drafts and a marker after them in one write, so the file holds both or neither. */
+	private _commitBoundaryDraftsWithMarker(drafts: SessionBoundaryDraft[], customType: string, data: unknown): void {
+		let appended: SessionEntry[] = [];
+		try {
+			this.sessionManager.batch(() => {
+				appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
+				const entry = this.sessionManager.getEntry(this.sessionManager.appendCustomEntry(customType, data));
+				if (entry) appended.push(entry);
+			});
+		} finally {
+			// On a failure memory went back to what the file holds, and the context follows it.
+			this._refreshFinalizedContext();
+		}
+		for (const entry of appended) this._emit({ type: "entry_appended", entry });
 	}
 
 	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
@@ -2023,7 +2049,15 @@ export class AgentSession {
 	 * see _restoreTurnPromptOptions().
 	 */
 	private async _settleRun(turnDone = true): Promise<void> {
-		if (turnDone) this._runSystemPromptOptions = undefined;
+		if (turnDone) {
+			this._runSystemPromptOptions = undefined;
+			// In the file too. A session reopened later restores the latest recorded options, and
+			// work after a finished turn belongs to the session's own options, not to that turn's.
+			const recorded = this._recordedPromptOptionChanges();
+			if (recorded && Object.keys(recorded).length > 0) {
+				this._appendInternalEntry(TURN_PROMPT_OPTIONS_ENTRY, { changes: {} });
+			}
+		}
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
 		await this._emitAgentSettled();
@@ -2425,7 +2459,12 @@ export class AgentSession {
 		this._turnContinueRequested = false;
 		const last = this.agent.state.messages[this.agent.state.messages.length - 1];
 		if (continueRequested && last && last.role !== "assistant") return false;
-		if (runBoundary && !this._agentRunAbortRequested) await this._runBeforeSettleBoundary();
+		if (!runBoundary || this._agentRunAbortRequested) return true;
+		// A seal that runs again ends the same turn again. The boundary already ran for it, and its
+		// entries are in the file, so running it again would add them twice.
+		const lastEntryId = last ? this._findPersistedMessageEntryId(last) : undefined;
+		if (last && this._findDispatch(SETTLE_DISPATCHED_ENTRY, last)) return true;
+		await this._runBeforeSettleBoundary(lastEntryId);
 		return true;
 	}
 
@@ -2518,7 +2557,11 @@ export class AgentSession {
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
 	}
 
-	private async _runBeforeSettleBoundary(): Promise<boolean> {
+	/**
+	 * `stepEntryId` names the last entry of a stepped turn. The boundary's entries and a marker
+	 * naming it then go in one write, so a seal that runs again can see the boundary already ran.
+	 */
+	private async _runBeforeSettleBoundary(stepEntryId?: string): Promise<boolean> {
 		if (!this._extensionRunner.hasHandlers("agent_before_settle")) return this.agent.hasQueuedMessages();
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
@@ -2527,7 +2570,13 @@ export class AgentSession {
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
 			);
-			this._commitBoundaryDrafts(result.entries);
+			if (stepEntryId) {
+				this._commitBoundaryDraftsWithMarker(result.entries, SETTLE_DISPATCHED_ENTRY, {
+					messageEntryId: stepEntryId,
+				});
+			} else {
+				this._commitBoundaryDrafts(result.entries);
+			}
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;

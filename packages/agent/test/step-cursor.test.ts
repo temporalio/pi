@@ -231,7 +231,7 @@ describe("the step cursor", () => {
 		}
 	});
 
-	it("refuses a model call that has nothing to start from, and records nothing", async () => {
+	it("reports a response that ended the run again, and refuses an empty transcript", async () => {
 		const { agent, recorded } = agentUnderTest();
 		await driveStep(agent);
 		const isAssistant = (m: AgentMessage): m is AssistantMessage => m.role === "assistant";
@@ -240,8 +240,9 @@ describe("the step cursor", () => {
 		agent.state.messages = [...agent.state.messages, failed];
 		const before = agent.state.messages.length;
 
-		// A failed assistant message recorded here would read as one more failed attempt.
-		await expect(agent.modelCall()).rejects.toThrow("Cannot step from message role: assistant");
+		// Reported again, not refused, so a caller that lost the first answer still seals it. Nothing
+		// is asked or recorded, since a new failed message would read as one more failed attempt.
+		expect(await agent.modelCall()).toEqual({ toolCalls: [], sequential: false, ended: true });
 		expect(agent.state.messages).toHaveLength(before);
 		expect(agent.state.isStreaming).toBe(false);
 

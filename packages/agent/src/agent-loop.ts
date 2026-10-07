@@ -244,10 +244,10 @@ export async function runAgentModelCall(
 
 	const last = context.messages[context.messages.length - 1];
 	if (last.role === "assistant") {
-		// A response with nothing to act on is not one a step can be resumed from; the caller
-		// settles it (prepareStep does) before asking for another.
+		// A response that ended the run is reported again, so a caller that lost the first answer
+		// still seals it, and the retry or compaction that answers for it still runs.
 		if (last.stopReason === "error" || last.stopReason === "aborted") {
-			throw new Error("Cannot step from message role: assistant");
+			return { toolCalls: [], sequential: false, ended: true };
 		}
 		// The seal that follows emits turn_end either way, so a replayed step has to open the turn
 		// too. An extension pairing the two would see the boundaries drift apart otherwise.

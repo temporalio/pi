@@ -980,7 +980,7 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(modelCalls).toBe(1);
 	});
 
-	it("leaves a refused step's turn as it was, prompt options included", async () => {
+	it("reports a failed response again without asking the model, so the seal still decides", async () => {
 		await createSession();
 		const failed = assistant([{ type: "text", text: "" }], "error");
 		seed([user("go"), failed]);
@@ -988,11 +988,13 @@ describe("AgentSession: settling an interrupted turn", () => {
 		const internals = session as unknown as { _runSystemPromptOptions: unknown };
 		internals._runSystemPromptOptions = options;
 
-		await expect(session.modelCall()).rejects.toThrow("Cannot step from message role: assistant");
-
-		expect(session.isIdle).toBe(true);
-		expect(internals._runSystemPromptOptions).toBe(options);
+		// The answer to the first model call was lost. The retry gets the same answer back.
+		expect(await session.modelCall()).toEqual({ toolCalls: [], sequential: false, ended: true });
 		expect(modelCalls).toBe(0);
+		expect(internals._runSystemPromptOptions).toBe(options);
+
+		await session.sealStep([]);
+		expect(session.isIdle).toBe(true);
 	});
 });
 
