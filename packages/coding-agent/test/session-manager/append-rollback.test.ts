@@ -1,15 +1,23 @@
+import type * as fs from "node:fs";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-const state = vi.hoisted(() => ({ failNextAppend: false }));
+const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false }));
 
 vi.mock("node:fs", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("node:fs")>();
+	const actual = await importOriginal<typeof fs>();
 	return {
 		...actual,
+		writeFileSync: ((...args: Parameters<typeof actual.writeFileSync>) => {
+			if (state.failNextWrite) {
+				state.failNextWrite = false;
+				throw new Error("disk said no");
+			}
+			return actual.writeFileSync(...args);
+		}) as typeof actual.writeFileSync,
 		appendFileSync: ((...args: Parameters<typeof actual.appendFileSync>) => {
 			if (state.failNextAppend) {
 				state.failNextAppend = false;
@@ -56,5 +64,22 @@ describe("SessionManager: a failed append", () => {
 			.filter((entry) => entry.type === "message");
 		expect(entries.map((entry) => entry.id)).toEqual([first, second]);
 		expect(entries[1].parentId).toBe(first);
+	});
+
+	it("removes a first write that failed part way, so the session can still be written", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+
+		state.failNextWrite = true;
+		expect(() => manager.appendMessage(user("one"))).toThrow("disk said no");
+		expect(existsSync(manager.getSessionFile()!)).toBe(false);
+
+		const first = manager.appendMessage(user("one"));
+		const ids = readFileSync(manager.getSessionFile()!, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line))
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.id);
+		expect(ids).toEqual([first]);
 	});
 });
