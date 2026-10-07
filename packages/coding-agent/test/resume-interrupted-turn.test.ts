@@ -441,6 +441,48 @@ describe("AgentSession: settling an interrupted turn", () => {
 		}
 	});
 
+	it("refuses a prompt when a branch summary started while it was built", async () => {
+		let release = () => {};
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("before_agent_start", async () => {
+				await held;
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			harness.setResponses([fauxAssistantMessage("answer")]);
+			const running = harness.session.prompt("go");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			// It started after the build's first check, and it rewrites the transcript too.
+			const open = harness.session as unknown as { _branchSummaryAbortController?: AbortController };
+			open._branchSummaryAbortController = new AbortController();
+			release();
+			await expect(running).rejects.toThrow("compaction is in progress");
+			open._branchSummaryAbortController = undefined;
+
+			expect(harness.session.isIdle).toBe(true);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("gives the session back when a turn fails to start", async () => {
+		await createSession();
+		const internals = session as unknown as { _beginTurn: () => void };
+		internals._beginTurn = () => {
+			throw new Error("could not record the selection");
+		};
+
+		await expect(session.prompt("go")).rejects.toThrow("could not record the selection");
+		expect(session.isIdle).toBe(true);
+		expect(modelCalls).toBe(0);
+	});
+
 	it("tells the loser of two concurrent starts that the session is taken", async () => {
 		let release = () => {};
 		await createSession(
