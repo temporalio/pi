@@ -382,6 +382,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	// A prompt is between its first build step that changes shared state and its claim.
+	private _buildingPrompt = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1836,22 +1838,29 @@ export class AgentSession {
 		// settle the calls again, and a turn it starts would answer the part it saw. While busy,
 		// both are refused or queued, as they are during a run.
 		this._isAgentRunActive = true;
+		let settled = false;
 		try {
-			return this._settleStoppedTurn();
+			const hasWork = this._settleStoppedTurn();
+			settled = true;
+			return hasWork;
 		} finally {
-			this._releaseRun();
+			this._releaseRun(settled);
 		}
 	}
 
 	/**
-	 * End a busy window that is not a run, such as a settle or a recording. Messages queued while
-	 * busy go in first, still busy, so a subscriber reacting to one queues behind the rest
-	 * instead of starting a turn between them.
+	 * End a busy window that is not a run, such as a settle or a recording. When the work
+	 * completed, messages queued while busy go in first, still busy, so a subscriber reacting
+	 * to one queues behind the rest instead of starting a turn between them. When it failed
+	 * they stay queued. Written after a part-settled step, they would hide its open calls from
+	 * the next settle.
 	 */
-	private _releaseRun(): void {
+	private _releaseRun(completed: boolean): void {
 		try {
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
+			if (completed) {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			}
 		} finally {
 			this._isAgentRunActive = false;
 			this._resolveIdleWaitIfIdle();
@@ -2104,7 +2113,7 @@ export class AgentSession {
 		try {
 			options?.preflightResult?.("started");
 		} catch (error) {
-			this._releaseRun();
+			this._releaseRun(false);
 			throw error;
 		}
 		await this._runAgentPrompt(messages);
@@ -2146,6 +2155,7 @@ export class AgentSession {
 		// The builder holds the session for this call. It stays busy until the prompt is in,
 		// because recording awaits the extensions' message handlers, and a step that started in
 		// between would answer part of it.
+		let recorded = false;
 		try {
 			options?.preflightResult?.("started");
 			this._beginTurn();
@@ -2154,9 +2164,10 @@ export class AgentSession {
 			const { messages: transcript, tools } = this.agent.state;
 			const declared = declareToolChanges({ messages: transcript, tools }, messages);
 			await this._recordMessagesThroughExtensions(declared);
+			recorded = true;
 		} finally {
 			// Queued while busy, these belong before the step that answers the prompt.
-			this._releaseRun();
+			this._releaseRun(recorded);
 		}
 		return true;
 	}
@@ -2229,6 +2240,26 @@ export class AgentSession {
 
 		beforeBuild?.();
 
+		// One build at a time from here. What follows changes shared state (the queues, the tool
+		// loadout, the prompt options), and extension hooks run between those changes. A second
+		// build is refused before it changes anything, so its hooks cannot touch this one's loadout.
+		if (this._buildingPrompt) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
+		this._buildingPrompt = true;
+		try {
+			return await this._buildNewTurn(expandedText, currentImages, beforeBuild);
+		} finally {
+			this._buildingPrompt = false;
+		}
+	}
+
+	/** The part of the build that starts a new turn. One runs at a time. */
+	private async _buildNewTurn(
+		expandedText: string,
+		currentImages: ImageContent[] | undefined,
+		beforeBuild?: () => void,
+	): Promise<AgentMessage[]> {
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
@@ -2297,7 +2328,7 @@ export class AgentSession {
 		try {
 			return this._finishPromptMessages(expandedText, normalized, result);
 		} catch (error) {
-			this._releaseRun();
+			this._releaseRun(false);
 			throw error;
 		}
 	}
