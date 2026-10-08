@@ -1533,6 +1533,11 @@ export interface SteppedModelCall extends AgentModelCallOutcome {
 export interface StepCallOptions {
 	/** The `stepId` the model call returned. The call is refused once its step is over. */
 	stepId?: string;
+	/**
+	 * Stops the call the way a user stop does. A driver whose unit of work was cancelled passes its
+	 * own signal, so the tool ends and reports what it did instead of running on unseen.
+	 */
+	signal?: AbortSignal;
 }
 
 export interface SealStepOptions extends StepCallOptions {

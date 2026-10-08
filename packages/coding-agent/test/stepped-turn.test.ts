@@ -123,6 +123,8 @@ describe("stepped turn", () => {
 			systemPrompt?: string;
 			/** The tool asks the turn to stop. */
 			terminate?: boolean;
+			/** The tool runs until its signal aborts. */
+			hang?: boolean;
 		} = {},
 	): Promise<Harness> {
 		const ran: string[] = [];
@@ -134,8 +136,13 @@ describe("stepped turn", () => {
 			label: "Dummy",
 			description: "Records what it was asked",
 			parameters: toolSchema,
-			async execute(_id, params) {
+			async execute(_id, params, signal) {
 				ran.push(params.q);
+				if (options.hang) {
+					await new Promise((_resolve, reject) => {
+						signal?.addEventListener("abort", () => reject(new Error(`stopped ${params.q}`)), { once: true });
+					});
+				}
 				const result = { content: [{ type: "text" as const, text: `did ${params.q}` }], details: { q: params.q } };
 				return options.terminate ? { ...result, terminate: true } : result;
 			},
@@ -626,6 +633,24 @@ describe("stepped turn", () => {
 		// The refused seal didn't settle the run under the running call.
 		expect(settled).toBe(0);
 		expect(result).toBeDefined();
+	});
+
+	it("stops a running call when the driver's signal aborts", async () => {
+		const harness = await createSession("signal-stops-call", { hang: true });
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const stop = new AbortController();
+		harness.session.subscribe((event) => {
+			// Once the tool is under way, as a cancellation arrives in practice.
+			if (event.type === "tool_execution_start") setTimeout(() => stop.abort(), 20);
+		});
+		const result = await harness.session.runToolCall("call_1", { signal: stop.signal });
+
+		// The tool ended and reported it, instead of running on after its driver gave up.
+		expect(result?.message.isError).toBe(true);
+		expect(JSON.stringify(result?.message.content)).toContain("stopped one");
+		await expect(harness.session.runToolCall("call_2", { signal: stop.signal })).rejects.toThrow();
+		expect(harness.ran).toEqual(["one"]);
 	});
 
 	it("replays what turn_end decided when its handler took the response out of the context", async () => {
