@@ -1829,19 +1829,30 @@ export class AgentSession {
 		try {
 			this._beginTurn();
 			await initial();
-			while (!this._agentRunAbortRequested) {
-				if (await this._handlePostAgentRun()) {
+			for (;;) {
+				while (!this._agentRunAbortRequested) {
+					if (await this._handlePostAgentRun()) {
+						if (this._agentRunAbortRequested) break;
+						await this.agent.continue();
+						continue;
+					}
+					if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 					if (this._agentRunAbortRequested) break;
 					await this.agent.continue();
-					continue;
 				}
-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+				// Only a run that finished. A stopped or failed one can also end on a result, and
+				// that turn still has work.
 				if (this._agentRunAbortRequested) break;
+				const queued = this.agent.peekQueuedMessages().length;
+				const marked = this._markTurnEndedOnResult();
+				// A subscriber to the marker can queue a turn, and the run is still the one to take
+				// it. Left queued, it waits for a prompt that may never come, while the marker tells
+				// a driver there's no work. Only what the marker's subscribers queued, though. What
+				// was queued before, the run's own checks already chose to leave.
+				if (this._agentRunAbortRequested || !marked) break;
+				if (this.agent.peekQueuedMessages().length <= queued) break;
 				await this.agent.continue();
 			}
-			// Only a run that finished. A stopped or failed one can also end on a result, and that
-			// turn still has work.
-			if (!this._agentRunAbortRequested) this._markTurnEndedOnResult();
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
@@ -1921,10 +1932,13 @@ export class AgentSession {
 		}
 	}
 
-	/** Write down that the turn is over when it ends on a result, which only `terminate` does. */
-	private _markTurnEndedOnResult(): void {
+	/**
+	 * Write down that the turn is over when it ends on a result, which only `terminate` does.
+	 * Returns whether it wrote the marker.
+	 */
+	private _markTurnEndedOnResult(): boolean {
 		const last = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
-		if (last?.role !== "toolResult") return;
+		if (last?.role !== "toolResult") return false;
 		// The transcript alone can end on a result for other reasons. A reply that overflowed is
 		// omitted before recovery, and if recovery fails, an earlier step's result is left at
 		// the tail. Only the run's last response asking for this call means its tools ended it.
@@ -1933,12 +1947,13 @@ export class AgentSession {
 		const final = this._runFinalResponse;
 		const callId = last.toolCallId;
 		const askedFor = final?.content.some((block) => block.type === "toolCall" && block.id === callId);
-		if (!askedFor) return;
+		if (!askedFor) return false;
 		const messageEntryId = this._findPersistedMessageEntryId(last);
-		if (!messageEntryId) return;
+		if (!messageEntryId) return false;
 		const entryId = this.sessionManager.appendCustomEntry(TURN_ENDED_ON_RESULT_ENTRY, { messageEntryId });
 		const entry = this.sessionManager.getEntry(entryId);
 		if (entry) this._emit({ type: "entry_appended", entry });
+		return true;
 	}
 
 	/** Whether the file says the turn ended on `message` on purpose. */

@@ -752,6 +752,29 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(session.prepareStep()).toBe(false);
 	});
 
+	it("runs a turn a subscriber queues when it hears the turn ended on a result", async () => {
+		const replies = [assistant([call("stop-1")], "toolUse"), answer("handled")];
+		await createSession(replies, undefined, { do: stopTool() });
+		let sent = false;
+		session.subscribe((event) => {
+			if (event.type !== "entry_appended" || sent) return;
+			const entry = event.entry;
+			if (entry.type !== "custom" || entry.customType !== "pi.turn-ended-on-result") return;
+			sent = true;
+			void session.sendCustomMessage(
+				{ customType: "follow-up", content: "one more thing", display: false },
+				{ triggerTurn: true },
+			);
+		});
+
+		await session.prompt("go");
+
+		expect(sent).toBe(true);
+		expect(modelCalls).toBe(2);
+		expect(JSON.stringify(persisted().at(-1))).toContain("handled");
+		expect(session.prepareStep()).toBe(false);
+	});
+
 	it("reads a turn its tools stopped as answered, also after a reopen", async () => {
 		const stop = {
 			name: "do",
