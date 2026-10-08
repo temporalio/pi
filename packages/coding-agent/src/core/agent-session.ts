@@ -2393,6 +2393,13 @@ export class AgentSession {
 	/** The model call, aborted like a user stop when `signal` aborts. A signal already aborted asks nothing. */
 	private async _modelCallUntil(signal: AbortSignal | undefined): Promise<AgentModelCallOutcome> {
 		if (signal?.aborted) throw signal.reason ?? new Error("model call was stopped before it ran");
+		// The seal that scheduled this retry can have run in another process. The file still holds
+		// the response it took out, which routes the request as a retry of that response.
+		if (!this._failedResponse) {
+			const pending = this._findOmittedStepResponse();
+			const failed = pending?.message.stopReason === "error" || pending?.message.stopReason === "length";
+			if (pending?.recovery && !pending.declined && failed) this._failedResponse = pending.message;
+		}
 		const stop = () => this.agent.abort();
 		signal?.addEventListener("abort", stop, { once: true });
 		try {
