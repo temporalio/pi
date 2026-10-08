@@ -229,7 +229,12 @@ describe("the step cursor", () => {
 
 		// Reported again, not refused, so a caller that lost the first answer still seals it. Nothing
 		// is asked or recorded, since a new failed message would read as one more failed attempt.
-		expect(await agent.modelCall()).toEqual({ toolCalls: [], sequential: false, ended: true });
+		expect(await agent.modelCall()).toEqual({
+			toolCalls: [],
+			sequential: false,
+			ended: true,
+			stepId: expect.any(String),
+		});
 		expect(agent.state.messages).toHaveLength(before);
 		expect(agent.state.isStreaming).toBe(false);
 

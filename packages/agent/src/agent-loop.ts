@@ -219,6 +219,12 @@ export interface AgentModelCallOutcome {
 	 * dispatch. The caller still seals to run its post-response policy.
 	 */
 	ended: boolean;
+	/**
+	 * Names the step this call opened. A call id is unique only within one response, and a
+	 * provider can reuse one in the next step. Pass this back to `runToolCall()` and `sealStep()`,
+	 * and a caller late for its step is refused instead of running or sealing the next one.
+	 */
+	stepId?: string;
 }
 
 /**

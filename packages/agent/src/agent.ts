@@ -1,4 +1,5 @@
 import {
+	type AssistantMessage,
 	createInitialSystemMessage,
 	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
@@ -493,15 +494,19 @@ export class Agent {
 				this.stepCursor,
 			);
 		});
-		return outcome;
+		return { ...outcome, stepId: this.currentStepId() };
 	}
 
 	/**
 	 * Run one call the current step recorded. Undefined means the transcript already held a
 	 * result for it, so nothing ran. One at a time: two calls of the same step run
 	 * concurrently only when they run against agents of their own.
+	 *
+	 * `options.stepId` is the one the model call returned. The call is refused once that step is
+	 * over, since the same call id can name a call of the next step.
 	 */
-	async runToolCall(toolCallId: string): Promise<TurnToolCallOutcome | undefined> {
+	async runToolCall(toolCallId: string, options: { stepId?: string } = {}): Promise<TurnToolCallOutcome | undefined> {
+		this.refuseStaleStep(options.stepId, `run call ${toolCallId}`);
 		return this.runStepUnit((signal) =>
 			runAgentToolCall(
 				this.createContextSnapshot(),
@@ -517,12 +522,14 @@ export class Agent {
 	/**
 	 * Close the current step with its results, in the order the model asked for the calls.
 	 * `expectCalls` names the step being closed, so a seal cannot attribute them to a message
-	 * something else appended in between.
+	 * something else appended in between. `options.stepId` refuses a seal whose step is over.
 	 */
 	async sealStep(
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 		expectCalls?: ReadonlyArray<string>,
+		options: { stepId?: string } = {},
 	): Promise<AgentStepOutcome> {
+		this.refuseStaleStep(options.stepId, "seal");
 		return this.runStepUnit((signal) =>
 			runAgentSeal(
 				this.createContextSnapshot(),
@@ -534,6 +541,19 @@ export class Agent {
 				this.stepCursor,
 			),
 		);
+	}
+
+	/** The id of the step the transcript ends in, from its response. */
+	private currentStepId(): string | undefined {
+		const last = this._state.messages.findLast(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		return last ? stepIdOf(last) : undefined;
+	}
+
+	private refuseStaleStep(stepId: string | undefined, what: string): void {
+		if (stepId === undefined || stepId === this.currentStepId()) return;
+		throw new Error(`Cannot ${what}: step ${stepId} is over`);
 	}
 
 	private normalizePromptInput(
@@ -758,4 +778,22 @@ export class Agent {
 			await listener(event, signal);
 		}
 	}
+}
+
+/**
+ * Names a step by its response. Built from what the response holds rather than from where it
+ * sits, so it survives a transcript that was serialized or rewritten in front of it. The request
+ * time and the calls differ between two steps even when a provider reuses a call id.
+ */
+function stepIdOf(message: AssistantMessage): string {
+	const calls = message.content
+		.filter((block) => block.type === "toolCall")
+		.map((call) => [call.id, call.name, call.arguments]);
+	const text = JSON.stringify([message.responseId ?? null, calls]);
+	// FNV-1a. The id only has to tell apart steps of one run, and this runs in a browser too.
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < text.length; index++) {
+		hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193);
+	}
+	return `${message.timestamp}-${(hash >>> 0).toString(16)}`;
 }

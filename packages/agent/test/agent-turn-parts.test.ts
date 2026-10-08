@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { Agent } from "../src/agent.ts";
 import {
 	runAgentLoopContinue,
 	runAgentModelCall,
@@ -452,5 +453,50 @@ describe("the split turn and the whole turn", () => {
 		const turnEvents = (events: AgentEvent[]) => events.filter((e) => e.type.startsWith("turn_")).map((e) => e.type);
 		expect(turnEvents(wholeEvents.events)).toEqual(["turn_start", "turn_end"]);
 		expect(turnEvents(splitEvents.events)).toEqual(turnEvents(wholeEvents.events));
+	});
+});
+
+describe("the step id", () => {
+	// A provider can reuse a call id in the next response. Two steps asking for `reused-id`, each
+	// with its own arguments.
+	const reusingAgent = () => {
+		const probe = probeTool();
+		const { streamFn } = scriptedModel([
+			() => createAssistantMessage([toolCall("reused-id", "probe", "A")], "toolUse"),
+			() => createAssistantMessage([toolCall("reused-id", "probe", "B")], "toolUse"),
+		]);
+		const agent = new Agent({ initialState: { tools: [probe.tool] }, streamFn, convertToLlm: identityConverter });
+		agent.state.messages = [createUserMessage("go")];
+		return { agent, ran: probe.ran };
+	};
+
+	it("refuses a call or a seal late for its step, though the call id names one of the next", async () => {
+		const { agent, ran } = reusingAgent();
+		const first = await agent.modelCall();
+		const firstResult = (await agent.runToolCall("reused-id", { stepId: first.stepId }))!;
+		await agent.sealStep([firstResult], ["reused-id"], { stepId: first.stepId });
+		const second = await agent.modelCall();
+		expect(second.stepId).toBeDefined();
+		expect(second.stepId).not.toBe(first.stepId);
+
+		await expect(agent.runToolCall("reused-id", { stepId: first.stepId })).rejects.toThrow(/is over/);
+		await expect(agent.sealStep([firstResult], ["reused-id"], { stepId: first.stepId })).rejects.toThrow(/is over/);
+		expect(ran).toEqual(["A"]);
+
+		// The rightful call of the second step still runs, and its seal records B, not A.
+		const secondResult = await agent.runToolCall("reused-id", { stepId: second.stepId });
+		expect(ran).toEqual(["A", "B"]);
+		await agent.sealStep([secondResult!], ["reused-id"], { stepId: second.stepId });
+		const results = agent.state.messages.filter((m) => m.role === "toolResult");
+		expect(results.map((m) => (m.content[0] as { text: string }).text)).toEqual(["ran: A", "ran: B"]);
+	});
+
+	it("stays the same for a step whose transcript was serialized", async () => {
+		const { agent } = reusingAgent();
+		const first = await agent.modelCall();
+		agent.state.messages = structuredClone(agent.state.messages);
+		const replay = await agent.modelCall();
+		expect(replay.stepId).toBe(first.stepId);
+		await expect(agent.runToolCall("reused-id", { stepId: first.stepId })).resolves.toBeDefined();
 	});
 });
