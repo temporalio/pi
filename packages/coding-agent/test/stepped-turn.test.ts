@@ -2,7 +2,7 @@
 // The loop's own tests cover the parts; what is pinned here is the session file, which is what
 // an outside driver actually keeps: the same turn split three ways has to leave the same
 // transcript, and a call's result must not reach the file before the step is sealed.
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, type AgentMessage, type AgentTool, type TurnToolCallOutcome } from "@earendil-works/pi-agent-core";
@@ -942,6 +942,40 @@ describe("stepped turn", () => {
 		const again = await reopen(first, "settled-compact-again", { responses, extension });
 		expect((await again.session.sealStep([], { stepId })).done).toBe(true);
 		expect(again.asked()).toBe(0);
+	});
+
+	it("routes a resumed whole turn as the retry an earlier run scheduled", async () => {
+		const overloaded = {
+			...assistant([{ type: "text", text: "" }]),
+			stopReason: "error" as const,
+			errorMessage: "overloaded_error: the server is overloaded",
+		};
+		const responses = [overloaded, assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("retry-crash", { responses, fastRetry: true });
+		// What a crash in the retry's backoff leaves behind.
+		const snapshot = join(tempDir, "retry-crash.jsonl");
+		const file = first.sessionManager.getSessionFile()!;
+		first.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") copyFileSync(file, snapshot);
+		});
+		await first.session.prompt("go");
+		expect(existsSync(snapshot)).toBe(true);
+
+		const extension = `export default p =>
+			p.registerTurnExecutor(t => t.run(), { resumeOnStart: true });`;
+		const resumed = await createSession("retry-resume", { responses, reuse: snapshot, extension });
+		resumed.session.agent.state.messages = resumed.sessionManager.buildSessionProjection().messages;
+		const seen: (AssistantMessage | undefined)[] = [];
+		const internals = resumed.session as unknown as { _failedResponse?: AssistantMessage };
+		const prepare = resumed.session.agent.prepareRequest;
+		resumed.session.agent.prepareRequest = (request, signal) => {
+			seen.push(internals._failedResponse);
+			return prepare?.(request, signal);
+		};
+		await resumed.session.bindExtensions({});
+		await resumed.session.waitForIdle();
+
+		expect(seen[0]?.errorMessage).toBe(overloaded.errorMessage);
 	});
 
 	it("continues as the first seal decided when a reopened seal runs again", async () => {

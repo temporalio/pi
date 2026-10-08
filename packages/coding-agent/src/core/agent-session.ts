@@ -2198,8 +2198,12 @@ export class AgentSession {
 		}
 
 		// prepareStep settled what the stop left behind, so the transcript needs nothing added.
+		// The turn's start clears a retry, and a resumed turn can be one, so it's read back after.
 		await this._drive(
-			() => this.agent.continue(),
+			() => {
+				this._restorePendingRetry();
+				return this.agent.continue();
+			},
 			async () => {},
 		);
 		return true;
@@ -2423,15 +2427,22 @@ export class AgentSession {
 	}
 
 	/** The model call, aborted like a user stop when `signal` aborts. A signal already aborted asks nothing. */
+	/**
+	 * The retry an earlier run scheduled, when this process did not schedule it. The run that took
+	 * the failed response out can have been in another process. The file still holds it, and it
+	 * routes the next request as a retry of that response, so a router picks the same way.
+	 */
+	private _restorePendingRetry(): void {
+		if (this._failedResponse) return;
+		const pending = this._findOmittedStepResponse();
+		const stopReason = pending?.message.stopReason;
+		const failed = stopReason === "error" || stopReason === "length";
+		if (pending?.recovery && !pending.declined && failed) this._failedResponse = pending.message;
+	}
+
 	private async _modelCallUntil(signal: AbortSignal | undefined): Promise<AgentModelCallOutcome> {
 		if (signal?.aborted) throw signal.reason ?? new Error("model call was stopped before it ran");
-		// The seal that scheduled this retry can have run in another process. The file still holds
-		// the response it took out, which routes the request as a retry of that response.
-		if (!this._failedResponse) {
-			const pending = this._findOmittedStepResponse();
-			const failed = pending?.message.stopReason === "error" || pending?.message.stopReason === "length";
-			if (pending?.recovery && !pending.declined && failed) this._failedResponse = pending.message;
-		}
+		this._restorePendingRetry();
 		const stop = () => this.agent.abort();
 		signal?.addEventListener("abort", stop, { once: true });
 		try {
