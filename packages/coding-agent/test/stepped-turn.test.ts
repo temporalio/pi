@@ -685,6 +685,68 @@ describe("stepped turn", () => {
 		expect((await harness.session.modelCall()).toolCalls).toHaveLength(2);
 	});
 
+	it("refuses a seal whose signal already aborted", async () => {
+		const extension = `export default p => p.on("turn_end", () => {
+			globalThis.steppedTurnEnds = (globalThis.steppedTurnEnds ?? 0) + 1;
+			return { entries: [{ type: "custom", customType: "turn-note", data: {} }] };
+		});`;
+		delete testGlobals.steppedTurnEnds;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const harness = await createSession("signal-aborted-seal", { responses, extension });
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+
+		await expect(harness.session.sealStep([], { signal: AbortSignal.abort() })).rejects.toThrow();
+		// Nothing of the seal ran or reached the file, and the run is not left open.
+		expect(testGlobals.steppedTurnEnds).toBeUndefined();
+		const notes = harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "turn-note");
+		expect(notes).toHaveLength(0);
+		expect(harness.session.isIdle).toBe(true);
+		expect((await harness.session.sealStep([])).done).toBe(true);
+		expect(testGlobals.steppedTurnEnds).toBe(1);
+		delete testGlobals.steppedTurnEnds;
+	});
+
+	it("stops a seal's turn_end handler when the driver's signal aborts", async () => {
+		const extension = `export default p => p.on("turn_end", async (_event, ctx) => {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			globalThis.steppedContinued = ctx.signal?.aborted === true;
+		});`;
+		delete testGlobals.steppedContinued;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const harness = await createSession("signal-stops-seal", { responses, extension });
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const stop = new AbortController();
+		setTimeout(() => stop.abort(), 10);
+
+		await harness.session.sealStep([], { signal: stop.signal });
+
+		expect(testGlobals.steppedContinued).toBe(true);
+		delete testGlobals.steppedContinued;
+		expect(harness.session.isIdle).toBe(true);
+	});
+
+	it("schedules no retry after a seal whose signal aborted", async () => {
+		const failed = assistant([{ type: "text", text: "" }], "error");
+		failed.errorMessage = "overloaded";
+		const responses = [failed, assistant([{ type: "text", text: "answer" }])];
+		const harness = await createSession("signal-stops-retry", { responses, fastRetry: true });
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const stop = new AbortController();
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") stop.abort();
+		});
+
+		// Without the stop the seal hands back a retry, because the budget is not spent.
+		expect((await harness.session.sealStep([], { signal: stop.signal })).done).toBe(true);
+		expect(harness.session.isIdle).toBe(true);
+		expect(harness.asked()).toBe(1);
+	});
+
 	it("replays what turn_end decided when its handler took the response out of the context", async () => {
 		const extension = `export default p => p.on("turn_end", (event) => ({
 			entries: [{ type: "context_edit", targetId: event.messageEntryId, replacement: null }],

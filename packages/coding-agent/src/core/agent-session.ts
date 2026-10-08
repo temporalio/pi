@@ -2483,10 +2483,30 @@ export class AgentSession {
 		}
 	}
 
-	/** The seal's decision, shared by the public entry point and the steps handed to an executor. */
+	/**
+	 * The seal's decision, shared by the public entry point and the steps handed to an executor.
+	 * When `options.signal` aborts, the seal stops the way a user stop does, retry and compaction
+	 * after it included. A signal already aborted throws and runs nothing.
+	 */
 	private async _sealStep(
 		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
 		options: SealStepOptions = {},
+	): Promise<SealStepResult> {
+		const signal = options.signal;
+		if (signal?.aborted) throw signal.reason ?? new Error("seal was stopped before it ran");
+		// Not awaited: abort() waits for the session to go idle, which this seal is holding up.
+		const stop = () => void this.abort();
+		signal?.addEventListener("abort", stop, { once: true });
+		try {
+			return await this._decideSeal(toolCalls, options);
+		} finally {
+			signal?.removeEventListener("abort", stop);
+		}
+	}
+
+	private async _decideSeal(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		options: SealStepOptions,
 	): Promise<SealStepResult> {
 		// turn_end handlers and a compaction after the seal can read the system prompt.
 		this._restoreTurnPromptOptions();
