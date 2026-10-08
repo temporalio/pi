@@ -779,6 +779,62 @@ describe("stepped turn", () => {
 		expect(again.asked()).toBe(0);
 	});
 
+	it("records a message queued during a step its tools ended before the turn goes on", async () => {
+		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
+		const responses = [assistant([call], "toolUse"), assistant([{ type: "text", text: "answered" }])];
+		const harness = await createSession("queued-after-stop", { responses, terminate: true });
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		// Queued while the step is still open, as a follow-up from an extension arrives.
+		harness.session.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "queued question" }],
+			timestamp: Date.now(),
+		});
+		const result = await harness.session.runToolCall("call_1");
+		const outcomes = result ? [result] : [];
+		const sealed = await harness.session.sealStep(outcomes, { expectCalls: ["call_1"] });
+
+		expect(sealed.done).toBe(false);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		// In the file, so a driver that reopens the session still has the question.
+		expect(shape(persisted(harness.sessionManager)).filter((m) => m.role !== "system")).toEqual([
+			{ role: "user" },
+			{ role: "assistant", content: ["toolCall"] },
+			{ role: "toolResult", call: "call_1", error: false },
+			{ role: "user" },
+		]);
+	});
+
+	it("goes on to a turn a subscriber queues on hearing the tools ended the turn", async () => {
+		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
+		const responses = [assistant([call], "toolUse"), assistant([{ type: "text", text: "answered" }])];
+		const harness = await createSession("queued-on-marker", { responses, terminate: true });
+		let sent = false;
+		harness.session.subscribe((event) => {
+			if (event.type !== "entry_appended" || sent) return;
+			const entry = event.entry;
+			if (entry.type !== "custom" || entry.customType !== "pi.turn-ended-on-result") return;
+			sent = true;
+			harness.session.agent.followUp({
+				role: "user",
+				content: [{ type: "text", text: "one more thing" }],
+				timestamp: Date.now(),
+			});
+		});
+		await harness.session.recordPrompt("go");
+		await harness.session.modelCall();
+		const result = await harness.session.runToolCall("call_1");
+		const outcomes = result ? [result] : [];
+		const sealed = await harness.session.sealStep(outcomes, { expectCalls: ["call_1"] });
+
+		expect(sent).toBe(true);
+		expect(sealed.done).toBe(false);
+		expect(persisted(harness.sessionManager).at(-1)?.role).toBe("user");
+		await driveStepped(harness);
+		expect(harness.asked()).toBe(2);
+	});
+
 	it("finishes a turn once when its seal runs again in a reopened session", async () => {
 		// The retry a durable driver makes: the seal's unit of work died after the boundary
 		// committed, and the next attempt opens the file in a process that remembers nothing.

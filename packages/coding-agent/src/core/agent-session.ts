@@ -2553,7 +2553,7 @@ export class AgentSession {
 		}
 		let done = !outcome.hasMoreToolCalls && !needsAnotherPass;
 		if (done) done = await this._settleSteppedTurn(options.postRun !== false);
-		if (!done) await this._admitQueuedMessages();
+		if (!done) await this._admitQueuedMessages(!outcome.hasMoreToolCalls);
 		// The counts are handed back so a caller that outlives this session can carry them to the
 		// next seal. The transcript they could be read from is something a compaction rewrites.
 		return { done, retryAttempt: this._retryAttempt, overflowRecoveryAttempted: this._overflowRecoveryAttempted };
@@ -2671,7 +2671,11 @@ export class AgentSession {
 		// A turn its tools stopped ends on their results. The marker tells a later seal or a
 		// reopened session that the turn is over, as it does for a turn run() drives. Not for a
 		// turn the user stopped, which still has work.
-		this._markTurnEndedOnResult();
+		const queued = this.agent.peekQueuedMessages().length;
+		const marked = this._markTurnEndedOnResult();
+		// A subscriber to the marker can queue a turn. The turn then goes on to take it, as run()
+		// does, and the seal's caller records it.
+		if (marked && this.agent.peekQueuedMessages().length > queued) return false;
 		// A seal that runs again ends the same turn again. The boundary already ran for it, and its
 		// entries are in the file, so running it again would add them twice. The marker names the
 		// step's response, because a message the boundary adds becomes the transcript's tail.
@@ -2685,11 +2689,20 @@ export class AgentSession {
 	/**
 	 * Record what is queued when it is all that keeps a stepped turn going. A step cannot start
 	 * from a settled answer: the next model call would replay it instead of asking the model.
+	 * The same holds once a step's tools ended it. The queue lives in memory, so a driver that
+	 * reopens the session would lose work the session already took. `stepEnded` says the step
+	 * asked for nothing more, which is when the ordinary loop takes its queue as well.
 	 */
-	private async _admitQueuedMessages(): Promise<void> {
-		const last = this.agent.state.messages[this.agent.state.messages.length - 1];
-		if (last?.role !== "assistant" || last.stopReason === "error" || last.stopReason === "aborted") return;
-		if (last.content.some((block) => block.type === "toolCall")) return;
+	private async _admitQueuedMessages(stepEnded: boolean): Promise<void> {
+		if (!stepEnded) return;
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		if (last?.role === "assistant") {
+			if (last.stopReason === "error" || last.stopReason === "aborted") return;
+			if (last.content.some((block) => block.type === "toolCall")) return;
+		} else if (last?.role !== "toolResult" || findDanglingToolCalls(messages).length > 0) {
+			return;
+		}
 		const queued = this.agent.takeQueuedMessages();
 		if (queued.length > 0) await this._recordMessagesThroughExtensions(queued);
 	}
