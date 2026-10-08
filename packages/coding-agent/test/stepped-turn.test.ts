@@ -125,6 +125,8 @@ describe("stepped turn", () => {
 			terminate?: boolean;
 			/** The tool runs until its signal aborts. */
 			hang?: boolean;
+			/** The first provider request runs until its signal aborts. */
+			hangModel?: boolean;
 		} = {},
 	): Promise<Harness> {
 		const ran: string[] = [];
@@ -151,9 +153,19 @@ describe("stepped turn", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
-			streamFn: (_model, context) => {
+			streamFn: (_model, context, streamOptions) => {
 				requests.push(context);
 				const stream = new MockAssistantStream();
+				if (options.hangModel && requests.length === 1) {
+					const aborted = assistant([], "aborted");
+					stream.push({ type: "start", partial: aborted });
+					streamOptions?.signal?.addEventListener(
+						"abort",
+						() => stream.push({ type: "error", reason: "aborted", error: aborted }),
+						{ once: true },
+					);
+					return stream;
+				}
 				queueMicrotask(() => {
 					const message = responses[Math.min(count, responses.length - 1)];
 					count++;
@@ -651,6 +663,40 @@ describe("stepped turn", () => {
 		expect(JSON.stringify(result?.message.content)).toContain("stopped one");
 		await expect(harness.session.runToolCall("call_2", { signal: stop.signal })).rejects.toThrow();
 		expect(harness.ran).toEqual(["one"]);
+	});
+
+	it("stops a model call when the driver's signal aborts", async () => {
+		const harness = await createSession("signal-stops-model", { hangModel: true });
+		await harness.session.recordPrompt("go");
+		const stop = new AbortController();
+		harness.session.subscribe((event) => {
+			// Once the provider request is under way, as a cancellation arrives in practice.
+			if (event.type === "message_start" && event.message.role === "assistant") setTimeout(() => stop.abort(), 20);
+		});
+		const outcome = await harness.session.modelCall({ signal: stop.signal });
+
+		// Reported like any aborted response, and recorded so the next attempt sees it.
+		expect(outcome.ended).toBe(true);
+		const last = persisted(harness.sessionManager).at(-1);
+		expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
+		await harness.session.sealStep([]);
+		expect(harness.session.isIdle).toBe(true);
+
+		// The session takes the next turn.
+		await harness.session.recordPrompt("again");
+		await driveStepped(harness);
+		expect(harness.ran).toEqual(["one", "two"]);
+	});
+
+	it("refuses a model call whose signal already aborted", async () => {
+		const harness = await createSession("signal-aborted-model");
+		await harness.session.recordPrompt("go");
+
+		await expect(harness.session.modelCall({ signal: AbortSignal.abort() })).rejects.toThrow();
+		// No provider request, and no run left open behind the refusal.
+		expect(harness.asked()).toBe(0);
+		expect(harness.session.isIdle).toBe(true);
+		expect((await harness.session.modelCall()).toolCalls).toHaveLength(2);
 	});
 
 	it("replays what turn_end decided when its handler took the response out of the context", async () => {
