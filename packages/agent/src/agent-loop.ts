@@ -406,8 +406,10 @@ export async function runAgentSeal(
 		if (call.type !== "toolCall") continue;
 		const outcome = provided.get(call.id);
 		const result = existing.get(call.id);
-		if (outcome) batch.push(outcome);
-		else if (result) batch.push({ message: result, terminate: false });
+		// The recorded result is the one the transcript and its listeners settled on, and a listener
+		// can have rewritten it. The outcome passed in still knows whether the tool asked to stop.
+		if (result) batch.push({ message: result, terminate: outcome?.terminate ?? false });
+		else if (outcome) batch.push(outcome);
 		// Nobody can say whether a call with neither ran. The step still closes, and the model is
 		// told the outcome is unknown, so the turn never ends with a call that has no result.
 		else batch.push(unknownToolCallOutcome(call));

@@ -500,3 +500,41 @@ describe("the step id", () => {
 		await expect(agent.runToolCall("reused-id", { stepId: first.stepId })).resolves.toBeDefined();
 	});
 });
+
+describe("a seal run again", () => {
+	it("hands the hooks the result the transcript recorded, not the outcome passed in again", async () => {
+		const probe = probeTool();
+		const { streamFn } = scriptedModel([() => createAssistantMessage([toolCall("t1")], "toolUse")]);
+		const seen: string[] = [];
+		const agent = new Agent({
+			initialState: { tools: [probe.tool] },
+			streamFn,
+			convertToLlm: identityConverter,
+			finishTurn: (turn) => {
+				seen.push(...turn.toolResults.map((m) => (m.content[0] as { text: string }).text));
+			},
+		});
+		agent.state.messages = [createUserMessage("go")];
+		let failed = false;
+		agent.subscribe((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") return;
+			// Redacts the recorded result, then fails before the turn boundary.
+			event.message.content = [{ type: "text", text: "[redacted]" }];
+			if (!failed) {
+				failed = true;
+				throw new Error("listener failed");
+			}
+		});
+
+		await agent.modelCall();
+		const outcome = (await agent.runToolCall("t1"))!;
+		// What a durable driver saved before the seal, so not the object the listener rewrote.
+		const saved = structuredClone(outcome);
+		await expect(agent.sealStep([outcome])).rejects.toThrow("listener failed");
+		await agent.sealStep([saved]);
+
+		const recorded = agent.state.messages.filter((m) => m.role === "toolResult");
+		expect(recorded.map((m) => (m.content[0] as { text: string }).text)).toEqual(["[redacted]"]);
+		expect(seen).toEqual(["[redacted]"]);
+	});
+});
