@@ -1258,6 +1258,9 @@ export class SessionManager {
 				appendFileSync(this.sessionFile, entries.map((e) => `${JSON.stringify(e)}\n`).join(""));
 			} catch (error) {
 				try {
+					// Asked again first. A writer that lost the file meanwhile would cut off the lines
+					// the new writer appended after `size`.
+					this._writeGuard?.();
 					truncateSync(this.sessionFile, size);
 				} catch {
 					// The append's own error is the one the caller needs.

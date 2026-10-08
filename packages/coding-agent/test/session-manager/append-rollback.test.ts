@@ -128,6 +128,26 @@ describe("SessionManager: a failed append", () => {
 		expect(ids).toEqual([first, second]);
 	});
 
+	it("leaves the file alone when it lost the file before cutting a failed append back", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		manager.appendMessage(user("one"));
+		const file = manager.getSessionFile()!;
+		// The guard lets the append through, then says no: another writer took the file while the
+		// append was failing, and may have appended after it.
+		let asked = 0;
+		manager.setWriteGuard(() => {
+			asked++;
+			if (asked > 1) throw new Error("another writer has the session");
+		});
+
+		const before = readFileSync(file).length;
+		state.tearNextAppend = true;
+		expect(() => manager.appendMessage(user("two"))).toThrow("disk full");
+		expect(asked).toBe(2);
+		// Not cut back. What follows the torn part may be the new writer's.
+		expect(readFileSync(file).length).toBe(before + 12);
+	});
+
 	it("asks the write guard again when a batch commits", () => {
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
 		const first = manager.appendMessage(user("one"));
