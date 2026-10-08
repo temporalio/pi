@@ -205,8 +205,8 @@ export interface StepCursor {
 	/**
 	 * The context and config the last model call ran under, after both preparation callbacks.
 	 * The loop keeps them for the rest of the run when a later preparation returns nothing, so
-	 * the next step starts from them too. Its messages are not kept: the agent's transcript is
-	 * where the step's results went.
+	 * the next step starts from them too. A history that preparation pruned stays pruned. The
+	 * messages the transcript gained after that call are added to it. See `stepMessages()`.
 	 */
 	runtime?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
 }
@@ -279,7 +279,11 @@ export async function runAgentModelCall(
 	const retry = cursor?.prepared;
 	const kept = cursor?.runtime;
 	const outcome = await runTurnModelCall({
-		context: retry ? { ...retry.context } : kept ? { ...kept.context, messages: context.messages } : { ...context },
+		context: retry
+			? { ...retry.context }
+			: kept
+				? { ...kept.context, messages: stepMessages(cursor, context.messages) }
+				: { ...context },
 		config: retry ? retry.config : (kept?.config ?? config),
 		newMessages: [],
 		pendingMessages: [],
@@ -343,7 +347,7 @@ export async function runAgentToolCall(
 	const stepContext = cursor?.prepared?.context ?? context;
 	const stepConfig = cursor?.prepared?.config ?? config;
 	return runTurnToolCall({
-		context: { ...stepContext, messages: context.messages },
+		context: { ...stepContext, messages: stepMessages(cursor, context.messages) },
 		assistantMessage,
 		toolCall,
 		config: stepConfig,
@@ -424,7 +428,7 @@ export async function runAgentSeal(
 	const stepContext = cursor?.prepared?.context ?? context;
 	const stepConfig = cursor?.prepared?.config ?? config;
 	const outcome = await sealTurnStep({
-		context: { ...stepContext, messages: context.messages },
+		context: { ...stepContext, messages: stepMessages(cursor, context.messages) },
 		config: stepConfig,
 		newMessages,
 		message,
@@ -448,6 +452,20 @@ export async function runAgentSeal(
 		hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls,
 		continueRequested: !outcome.done && outcome.continueRequested,
 	};
+}
+
+/**
+ * The messages a stepped call runs against, the same ones the loop's own context holds. That is
+ * the history the last model call saw, which preparation can have pruned, and the messages the
+ * transcript gained after its response. The removed history does not come back. When the
+ * transcript no longer holds that response, something rewrote it, and the transcript is used.
+ */
+function stepMessages(cursor: StepCursor | undefined, transcript: AgentMessage[]): AgentMessage[] {
+	const kept = cursor?.runtime?.context.messages;
+	const response = kept?.[kept.length - 1];
+	const at = response ? transcript.lastIndexOf(response) : -1;
+	if (!kept || at < 0) return transcript;
+	return [...kept, ...transcript.slice(at + 1)];
 }
 
 function clearCursor(cursor: StepCursor): void {

@@ -273,6 +273,124 @@ describe("the step cursor", () => {
 		expect(await run(true)).toEqual(ordinary);
 	});
 
+	// A replaced history stays replaced in the loop. The calls, the seal and later requests see it,
+	// plus what the run added since, and never the history it removed.
+	describe("keeps a replaced history for the rest of the run, as the loop does", () => {
+		const tagOf = (message: AgentMessage) => {
+			if (message.role === "toolResult") return `result:${message.toolCallId}`;
+			if (message.role === "assistant") {
+				const call = message.content.find((block) => block.type === "toolCall");
+				return call ? `call:${call.id}` : "assistant";
+			}
+			if (message.role === "user") return `user:${textOf(message)}`;
+			return message.role;
+		};
+		const textOf = (message: AgentMessage) =>
+			message.role === "user" && typeof message.content !== "string"
+				? message.content.map((block) => (block.type === "text" ? block.text : "")).join("")
+				: (message as { content: string }).content;
+		const pruned = (context: AgentContext): AgentContext => ({
+			...context,
+			messages: context.messages.filter((message) => !(message.role === "user" && textOf(message) === "old")),
+		});
+
+		const run = async (stepped: boolean, replace: "prepareRequest" | "prepareNextTurn") => {
+			const seen: string[] = [];
+			// The tool declaration lands before or after the prompt by how the run started, which is not
+			// what this compares.
+			const record = (phase: string, messages: AgentMessage[]) =>
+				seen.push(
+					`${phase} ${messages
+						.filter((message) => message.role !== "system")
+						.map(tagOf)
+						.join(",")}`,
+				);
+			let requests = 0;
+			let preparations = 0;
+			const agent = new Agent({
+				initialState: { tools: [echoTool] },
+				prepareRequest: ({ context }) => {
+					if (replace !== "prepareRequest" || requests > 0) return undefined;
+					return { context: pruned(context) };
+				},
+				prepareNextTurnWithContext: (turn) => {
+					preparations++;
+					if (replace !== "prepareNextTurn" || preparations > 1) return undefined;
+					return { context: pruned(turn.context) };
+				},
+				beforeToolCall: async ({ context }) => {
+					record("tool", context.messages);
+					return undefined;
+				},
+				finishTurn: (turn) => {
+					record("seal", turn.context.messages);
+				},
+				streamFn: (_model, context) => {
+					record("request", context.messages);
+					requests++;
+					const more = requests <= 2;
+					const stream = createAssistantMessageEventStream();
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: more
+							? [{ type: "toolCall", id: `call-${requests}`, name: "echo", arguments: { value: "x" } }]
+							: [{ type: "text", text: "done" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "mock",
+						timestamp: Date.now(),
+						stopReason: more ? "toolUse" : "stop",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+					};
+					queueMicrotask(() => stream.push({ type: "done", reason: more ? "toolUse" : "stop", message }));
+					return stream;
+				},
+			});
+			agent.state.messages = [{ role: "user", content: "old", timestamp: Date.now() }];
+			if (stepped) {
+				agent.state.messages = [...agent.state.messages, { role: "user", content: "run", timestamp: Date.now() }];
+				for (let step = 0; step < 3; step++) await driveStep(agent);
+			} else {
+				await agent.prompt("run");
+			}
+			return seen;
+		};
+
+		it("after prepareRequest prunes once and then returns nothing", async () => {
+			const ordinary = await run(false, "prepareRequest");
+			expect(ordinary).toEqual([
+				"request user:run",
+				"tool user:run,call:call-1",
+				"seal user:run,call:call-1,result:call-1",
+				"request user:run,call:call-1,result:call-1",
+				"tool user:run,call:call-1,result:call-1,call:call-2",
+				"seal user:run,call:call-1,result:call-1,call:call-2,result:call-2",
+				"request user:run,call:call-1,result:call-1,call:call-2,result:call-2",
+				"seal user:run,call:call-1,result:call-1,call:call-2,result:call-2,assistant",
+			]);
+			expect(await run(true, "prepareRequest")).toEqual(ordinary);
+		});
+
+		it("after a one-time prepareNextTurn replacement", async () => {
+			const ordinary = await run(false, "prepareNextTurn");
+			expect(ordinary.slice(3)).toEqual([
+				"request user:run,call:call-1,result:call-1",
+				"tool user:run,call:call-1,result:call-1,call:call-2",
+				"seal user:run,call:call-1,result:call-1,call:call-2,result:call-2",
+				"request user:run,call:call-1,result:call-1,call:call-2,result:call-2",
+				"seal user:run,call:call-1,result:call-1,call:call-2,result:call-2,assistant",
+			]);
+			expect(await run(true, "prepareNextTurn")).toEqual(ordinary);
+		});
+	});
+
 	it("forgets what the last run's steps left behind on reset() and startTurn()", async () => {
 		for (const fresh of [(agent: Agent) => agent.reset(), (agent: Agent) => agent.startTurn()]) {
 			const { agent, recorded } = agentUnderTest();
