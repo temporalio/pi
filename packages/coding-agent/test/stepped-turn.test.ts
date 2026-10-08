@@ -1011,6 +1011,38 @@ describe("stepped turn", () => {
 		expect(harness.session.isStreaming).toBe(false);
 	});
 
+	it("keeps a note queued behind a step an executor left open when it failed", async () => {
+		const extension = `export default p => p.registerTurnExecutor(async (turn) => {
+			await turn.steps.record();
+			await turn.steps.modelCall();
+			await globalThis.queueNote?.();
+			throw new Error("executor failed");
+		});`;
+		const globals = globalThis as typeof globalThis & { queueNote?: () => Promise<void> };
+		const call = { type: "toolCall" as const, id: "call_1", name: "dummy", arguments: { q: "one" } };
+		const responses = [assistant([call], "toolUse"), assistant([{ type: "text", text: "answer" }])];
+		const harness = await createSession("failed-executor", { responses, extension });
+		await harness.session.bindExtensions({});
+		globals.queueNote = () =>
+			harness.session.sendCustomMessage(
+				{ customType: "note", content: "context", display: false },
+				{ triggerTurn: false },
+			);
+
+		await expect(harness.session.prompt("go")).rejects.toThrow("executor failed");
+		delete globals.queueNote;
+		// The step's call is still the tail, so the next settle can see it is open.
+		expect(persisted(harness.sessionManager).at(-1)?.role).toBe("assistant");
+
+		const again = await reopen(harness, "failed-executor-again", { responses });
+		expect(again.session.prepareStep()).toBe(true);
+		const tail = persisted(again.sessionManager).filter((m) => m.role !== "system");
+		expect(shape(tail).slice(-2)).toEqual([
+			{ role: "assistant", content: ["toolCall"] },
+			{ role: "toolResult", call: "call_1", error: true },
+		]);
+	});
+
 	it("continues as the first seal decided when a reopened seal runs again", async () => {
 		const extension = `export default p => {
 			p.on("turn_end", () => {

@@ -2073,8 +2073,11 @@ export class AgentSession {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;
 			// A stopped or failed turn still has work, and a resumed run needs the options it was
-			// built with. Only a turn that ran to its end gives them up.
-			await this._settleRun(finished);
+			// built with. Only a turn that ran to its end gives them up. Messages queued while a
+			// step is still open stay queued. Written now, they'd hide its calls from the settle
+			// that closes the step, and that settle writes them after its results.
+			const stepOpen = findDanglingToolCalls(this.agent.state.messages).length > 0;
+			await this._settleRun(finished, !stepOpen);
 		}
 	}
 
