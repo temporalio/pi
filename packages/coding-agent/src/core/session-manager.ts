@@ -399,24 +399,42 @@ function batchFrameOf(entry: FileEntry): Partial<BatchFrame> | undefined {
  */
 function dropIncompleteBatches(entries: FileEntry[]): FileEntry[] {
 	const kept: FileEntry[] = [];
-	let i = 0;
-	while (i < entries.length) {
-		const frame = batchFrameOf(entries[i]);
-		if (!frame) {
-			kept.push(entries[i++]);
-			continue;
-		}
-		let end = i + 1;
-		while (end < entries.length && batchFrameOf(entries[end])?.id === frame.id) end++;
-		if (end - i === frame.size) {
-			for (const entry of entries.slice(i, end)) {
+	const filter = createBatchFilter((entry) => kept.push(entry));
+	for (const entry of entries) filter.push(entry);
+	filter.end();
+	return kept;
+}
+
+/**
+ * dropIncompleteBatches() for a reader that gets one entry at a time. It holds back only the
+ * current batch, so a reader that streams a large file does not keep all of it in memory.
+ */
+function createBatchFilter(keep: (entry: FileEntry) => void) {
+	let run: FileEntry[] = [];
+	let frame: Partial<BatchFrame> | undefined;
+	const end = () => {
+		if (frame && run.length === frame.size) {
+			for (const entry of run) {
 				delete (entry as { batch?: unknown }).batch;
-				kept.push(entry);
+				keep(entry);
 			}
 		}
-		i = end;
-	}
-	return kept;
+		run = [];
+		frame = undefined;
+	};
+	return {
+		push(entry: FileEntry) {
+			const entryFrame = batchFrameOf(entry);
+			if (frame && entryFrame?.id !== frame.id) end();
+			if (!entryFrame) {
+				keep(entry);
+				return;
+			}
+			frame ??= entryFrame;
+			run.push(entry);
+		},
+		end,
+	};
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -917,6 +935,34 @@ async function buildSessionInfo(
 			crlfDelay: Infinity,
 		});
 
+		// The list shows only what opening the session shows.
+		const filter = createBatchFilter((entry) => {
+			// Extract session name (use latest, including explicit clears)
+			if (entry.type === "session_info") {
+				name = entry.name?.trim() || undefined;
+			}
+
+			if (entry.type !== "message") return;
+			messageCount++;
+
+			const activityTime = getMessageActivityTime(entry);
+			if (typeof activityTime === "number") {
+				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+			}
+
+			const message = entry.message;
+			if (!isMessageWithContent(message)) return;
+			if (message.role !== "user" && message.role !== "assistant") return;
+
+			const textContent = extractTextContent(message);
+			if (!textContent) return;
+
+			allMessages.push(textContent);
+			if (!firstMessage && message.role === "user") {
+				firstMessage = textContent;
+			}
+		});
+
 		for await (const line of rl) {
 			const entry = parseSessionEntryLine(line);
 			if (!entry) continue;
@@ -927,31 +973,9 @@ async function buildSessionInfo(
 				continue;
 			}
 
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
-			}
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
+			filter.push(entry);
 		}
+		filter.end();
 
 		if (!header) return null;
 

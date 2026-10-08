@@ -345,6 +345,27 @@ describe("SessionManager: a batch cut short on disk", () => {
 		expect(reopened.getLeafId()).toBe(first);
 	});
 
+	it("lists only what a load keeps of a batch", async () => {
+		const sessions = join(dir, "sessions");
+		const manager = SessionManager.create(dir, sessions);
+		manager.batch(() => {
+			manager.appendMessage(user("lost prompt"));
+			manager.appendCustomEntry("commit", { n: 1 });
+		});
+		const file = manager.getSessionFile()!;
+		const [whole] = await SessionManager.list(dir, sessions);
+		expect(whole.messageCount).toBe(1);
+		expect(whole.firstMessage).toBe("lost prompt");
+
+		const lines = readFileSync(file, "utf8").split("\n");
+		writeFileSync(file, `${lines.slice(0, 2).join("\n")}\n`);
+		expect(SessionManager.open(file).getEntries()).toEqual([]);
+		const [torn] = await SessionManager.list(dir, sessions);
+		expect(torn.messageCount).toBe(0);
+		expect(torn.firstMessage).toBe("(no messages)");
+		expect(torn.allMessagesText).toBe("");
+	});
+
 	it("loads a file without frames exactly as written", () => {
 		const file = join(dir, "old.jsonl");
 		const entries = [
