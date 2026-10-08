@@ -1,4 +1,5 @@
 import {
+	type AssistantMessage,
 	createInitialSystemMessage,
 	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
@@ -11,7 +12,17 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import {
+	type AgentModelCallOutcome,
+	type AgentStepOutcome,
+	runAgentLoop,
+	runAgentLoopContinue,
+	runAgentModelCall,
+	runAgentSeal,
+	runAgentToolCall,
+	type StepCursor,
+	type TurnToolCallOutcome,
+} from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -216,6 +227,13 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private _interrupted = false;
+	/**
+	 * What the last step left for the next one, and what the current step prepared. The loop keeps
+	 * this in a local when it drives itself; a caller stepping from outside has no such local, so
+	 * the agent holds it. See `StepCursor`.
+	 */
+	private stepCursor: StepCursor = {};
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -326,6 +344,12 @@ export class Agent {
 		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
 	}
 
+	/** Take the messages the next turn would start with, selected the way `continue()` selects them. */
+	takeQueuedMessages(): AgentMessage[] {
+		const steering = this.steeringQueue.drain();
+		return steering.length > 0 ? steering : this.followUpQueue.drain();
+	}
+
 	/** Preview the messages selected for the next turn without consuming them. */
 	peekQueuedMessages(): AgentMessage[] {
 		const steering = this.steeringQueue.peek();
@@ -339,7 +363,27 @@ export class Agent {
 
 	/** Abort the current run, if one is active. */
 	abort(): void {
+		this._interrupted = true;
 		this.activeRun?.abortController.abort();
+	}
+
+	/**
+	 * Whether a stop was asked for since the turn started. An abort reaches the unit of work that
+	 * is running, and a turn driven a step at a time has more units after it, each with a signal of
+	 * its own. A driver that does not ask this runs work the user stopped.
+	 */
+	get interrupted(): boolean {
+		return this._interrupted;
+	}
+
+	/**
+	 * Start a fresh turn. A stop asked for during the last turn does not carry in, and neither does
+	 * what the last turn's steps left for the next one. Callers that drive the steps themselves own
+	 * the turn boundary, so they call this before a new turn's first model call.
+	 */
+	startTurn(): void {
+		this._interrupted = false;
+		this.stepCursor = {};
 	}
 
 	/**
@@ -365,6 +409,8 @@ export class Agent {
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
+		// The conversation it belongs to is gone.
+		this.stepCursor = {};
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
@@ -377,6 +423,8 @@ export class Agent {
 			);
 		}
 		const messages = this.normalizePromptInput(input, images);
+		// A new prompt is a new turn, so a stop asked for during the last one does not carry in.
+		this._interrupted = false;
 		await this.runPromptMessages(messages);
 	}
 
@@ -394,12 +442,15 @@ export class Agent {
 		if (lastMessage.role === "assistant") {
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
+				// A queued message starts a turn of its own, same as prompt().
+				this._interrupted = false;
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
+				this._interrupted = false;
 				await this.runPromptMessages(queuedFollowUps);
 				return;
 			}
@@ -408,6 +459,101 @@ export class Agent {
 		}
 
 		await this.runContinuation();
+	}
+
+	/**
+	 * The model call of one step, without the tools it asks for. Each reported call can then
+	 * run as its own unit of work, which is where a retry policy, a timeout or an approval
+	 * goes. The caller runs them and then calls sealStep(), including when nothing was run.
+	 */
+	async modelCall(): Promise<AgentModelCallOutcome> {
+		if (this.activeRun) {
+			throw new Error("Agent is already processing. Wait for completion before stepping.");
+		}
+
+		// Inside the lifecycle a refusal becomes a failed assistant message, which reads as a
+		// failed provider attempt.
+		const lastMessage = this._state.messages[this._state.messages.length - 1];
+		if (!lastMessage) {
+			throw new Error("No messages to step from");
+		}
+		// A failed run is handled inside the lifecycle, so the default stands and the caller
+		// dispatches nothing.
+		let outcome: AgentModelCallOutcome = {
+			toolCalls: [],
+			sequential: false,
+			ended: true,
+		};
+		await this.runWithLifecycle(async (signal) => {
+			outcome = await runAgentModelCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+				this.stepCursor,
+			);
+		});
+		return { ...outcome, stepId: this.currentStepId() };
+	}
+
+	/**
+	 * Run one call the current step recorded. Undefined means the transcript already held a
+	 * result for it, so nothing ran. One at a time: two calls of the same step run
+	 * concurrently only when they run against agents of their own.
+	 *
+	 * `options.stepId` is the one the model call returned. The call is refused once that step is
+	 * over, since the same call id can name a call of the next step.
+	 */
+	async runToolCall(toolCallId: string, options: { stepId?: string } = {}): Promise<TurnToolCallOutcome | undefined> {
+		this.refuseStaleStep(options.stepId, `run call ${toolCallId}`);
+		return this.runStepUnit((signal) =>
+			runAgentToolCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCallId,
+				(event) => this.processEvents(event),
+				signal,
+				this.stepCursor,
+			),
+		);
+	}
+
+	/**
+	 * Close the current step with its results, in the order the model asked for the calls.
+	 * `expectCalls` names the step being closed, so a seal cannot attribute them to a message
+	 * something else appended in between. `options.stepId` refuses a seal whose step is over.
+	 */
+	async sealStep(
+		toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+		expectCalls?: ReadonlyArray<string>,
+		options: { stepId?: string } = {},
+	): Promise<AgentStepOutcome> {
+		this.refuseStaleStep(options.stepId, "seal");
+		return this.runStepUnit((signal) =>
+			runAgentSeal(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				toolCalls,
+				(event) => this.processEvents(event),
+				signal,
+				expectCalls,
+				this.stepCursor,
+			),
+		);
+	}
+
+	/** The id of the step the transcript ends in, from its response. */
+	private currentStepId(): string | undefined {
+		const last = this._state.messages.findLast(
+			(message): message is AssistantMessage => message.role === "assistant",
+		);
+		return last ? stepIdOf(last) : undefined;
+	}
+
+	private refuseStaleStep(stepId: string | undefined, what: string): void {
+		if (stepId === undefined || stepId === this.currentStepId()) return;
+		throw new Error(`Cannot ${what}: step ${stepId} is over`);
 	}
 
 	private normalizePromptInput(
@@ -433,6 +579,9 @@ export class Agent {
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
+		// The loop keeps its own completed turn, and a new prompt is a new run: the turn before it
+		// is not one this run prepares from. Anything a stepping caller left is spent here.
+		this.stepCursor = {};
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
 				messages,
@@ -446,6 +595,7 @@ export class Agent {
 	}
 
 	private async runContinuation(): Promise<void> {
+		this.stepCursor = {};
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
@@ -505,25 +655,43 @@ export class Agent {
 	}
 
 	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
-		if (this.activeRun) {
-			throw new Error("Agent is already processing.");
+		const abortController = this.openRun("Agent is already processing.");
+		this._state.errorMessage = undefined;
+		try {
+			await executor(abortController.signal);
+		} catch (error) {
+			await this.handleRunFailure(error, abortController.signal.aborted);
+		} finally {
+			this.finishRun();
 		}
+	}
 
+	/** Mark a run active and hand back the controller that aborts it. `finishRun()` is its pair. */
+	private openRun(busyMessage: string): AbortController {
+		if (this.activeRun) {
+			throw new Error(busyMessage);
+		}
 		const abortController = new AbortController();
 		let resolvePromise = () => {};
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
 		this.activeRun = { promise, resolve: resolvePromise, abortController };
-
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
-		this._state.errorMessage = undefined;
+		return abortController;
+	}
 
+	/**
+	 * The same run window as runWithLifecycle, except that a failure is the caller's. A tool
+	 * call and a seal both happen after the step's message is recorded, so turning a failure
+	 * into an assistant message would leave one sitting behind a message still being settled,
+	 * and the calls it hides would stop reading as unsettled.
+	 */
+	private async runStepUnit<T>(executor: (signal: AbortSignal) => Promise<T>): Promise<T> {
+		const abortController = this.openRun("Agent is already processing. Wait for completion before stepping.");
 		try {
-			await executor(abortController.signal);
-		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			return await executor(abortController.signal);
 		} finally {
 			this.finishRun();
 		}
@@ -610,4 +778,22 @@ export class Agent {
 			await listener(event, signal);
 		}
 	}
+}
+
+/**
+ * Names a step by its response. Built from what the response holds rather than from where it
+ * sits, so it survives a transcript that was serialized or rewritten in front of it. The request
+ * time and the calls differ between two steps even when a provider reuses a call id.
+ */
+function stepIdOf(message: AssistantMessage): string {
+	const calls = message.content
+		.filter((block) => block.type === "toolCall")
+		.map((call) => [call.id, call.name, call.arguments]);
+	const text = JSON.stringify([message.responseId ?? null, calls]);
+	// FNV-1a. The id only has to tell apart steps of one run, and this runs in a browser too.
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < text.length; index++) {
+		hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193);
+	}
+	return `${message.timestamp}-${(hash >>> 0).toString(16)}`;
 }

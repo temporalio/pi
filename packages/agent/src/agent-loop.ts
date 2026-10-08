@@ -150,6 +150,17 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+export interface AgentStepOutcome {
+	messages: AgentMessage[];
+	/** True when the turn ran tools whose results still need another step. */
+	hasMoreToolCalls: boolean;
+	/**
+	 * `finishTurn` asked for another request after this step. The loop makes one even when
+	 * nothing else schedules it; a caller stepping from outside makes that call itself.
+	 */
+	continueRequested: boolean;
+}
+
 // What the transcript says about a call when nothing can say whether it ran. The tool can have had
 // its effect before the run stopped, so calling it a failure would invite a second run of something
 // that already happened. The transcript only shows the model asked for the call, not that it ran,
@@ -173,6 +184,330 @@ export function unknownToolCallOutcome(toolCall: { id: string; name: string }): 
 		},
 		terminate: false,
 	};
+}
+
+/**
+ * What one step leaves behind for the next one, held by a caller driving the loop from outside the
+ * way `runLoop` holds it in a local. `previousTurn` is the completed turn the app's preparation
+ * callback is handed. It cannot be rebuilt from the transcript, which a compaction rewrites.
+ * `prepared` is what that callback returned, which can replace the context and the model, so the
+ * tools and the seal of the step run against it. It lives until the step is sealed, which is also
+ * what makes a retried model call reuse the preparation instead of running it twice.
+ *
+ * It lives in memory only. A unit of work in a process that never saw the earlier ones starts
+ * without it. Its first model call does not prepare, and its tools and seal use the agent's own
+ * context and config. A driver that moves steps between processes needs a preparation callback
+ * whose results are in the transcript or are cheap to make again.
+ */
+export interface StepCursor {
+	previousTurn?: PrepareNextTurnContext;
+	prepared?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
+	/**
+	 * The context and config the last model call ran under, after both preparation callbacks.
+	 * The loop keeps them for the rest of the run when a later preparation returns nothing, so
+	 * the next step starts from them too. A history that preparation pruned stays pruned. The
+	 * messages the transcript gained after that call are added to it. See `stepMessages()`.
+	 */
+	runtime?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
+}
+
+export interface AgentModelCallOutcome {
+	/** The calls the model asked for, in the order it asked for them. */
+	toolCalls: AgentToolCall[];
+	/** Whether the calls have to run one at a time. */
+	sequential: boolean;
+	/**
+	 * The response ended the run on its own (an error or an abort). There is nothing to
+	 * dispatch. The caller still seals to run its post-response policy.
+	 */
+	ended: boolean;
+	/**
+	 * Names the step this call opened. A call id is unique only within one response, and a
+	 * provider can reuse one in the next step. Pass this back to `runToolCall()` and `sealStep()`,
+	 * and a caller late for its step is refused instead of running or sealing the next one.
+	 */
+	stepId?: string;
+}
+
+/**
+ * The model call of one step, on its own. This entry point does not run the recorded calls, so a
+ * caller can put each of them somewhere the loop cannot see: its own unit of work, its own
+ * retry policy, its own approval.
+ *
+ * When the transcript already ends on the step's response, the response is reported again and
+ * the model is not asked. That says nothing about whether any of its calls ran, so the caller
+ * still checks for recorded results before running one.
+ */
+export async function runAgentModelCall(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+	cursor?: StepCursor,
+): Promise<AgentModelCallOutcome> {
+	if (context.messages.length === 0) {
+		throw new Error("Cannot step: no messages in context");
+	}
+
+	const last = context.messages[context.messages.length - 1];
+	if (last.role === "assistant") {
+		// A response that ended the run is reported again, so a caller that lost the first answer
+		// still seals it, and the retry or compaction that answers for it still runs.
+		if (last.stopReason === "error" || last.stopReason === "aborted") {
+			return { toolCalls: [], sequential: false, ended: true };
+		}
+		// The seal that follows emits turn_end either way, so a replayed step has to open the turn
+		// too. An extension pairing the two would see the boundaries drift apart otherwise.
+		await emit({ type: "turn_start" });
+		const toolCalls = last.content.filter((c) => c.type === "toolCall");
+		// Against the prepared state when this step has some. A replay is the same step arriving
+		// again, so it must not prepare a second time and must not consume the completed turn,
+		// which the model call it is replaying already did or has still to do.
+		const replayContext = cursor?.prepared?.context ?? context;
+		const replayConfig = cursor?.prepared?.config ?? config;
+		return {
+			toolCalls,
+			sequential: mustRunToolCallsInOrder(replayContext, replayConfig, last, toolCalls),
+			ended: false,
+		};
+	}
+
+	// A step that already prepared is being retried, not started: the provider attempt failed and
+	// this is another one. Preparing again would run the app's callback twice for one step, and
+	// compaction is the kind of thing that callback does.
+	const retry = cursor?.prepared;
+	const kept = cursor?.runtime;
+	const outcome = await runTurnModelCall({
+		context: retry
+			? { ...retry.context }
+			: kept
+				? { ...kept.context, messages: stepMessages(cursor, context.messages) }
+				: { ...context },
+		config: retry ? retry.config : (kept?.config ?? config),
+		newMessages: [],
+		pendingMessages: [],
+		previousTurn: retry ? undefined : cursor?.previousTurn,
+		onPrepared: cursor
+			? (state) => {
+					// Recorded here rather than after the call returns, so an attempt that dies in
+					// the provider does not leave the next one preparing the same step again.
+					cursor.prepared = state;
+					cursor.previousTurn = undefined;
+				}
+			: undefined,
+		emitTurnStart: true,
+		signal,
+		emit,
+		streamFunction: streamFn ?? getDefaultStreamFn(),
+	});
+
+	if (cursor) {
+		cursor.prepared = { context: outcome.context, config: outcome.config };
+		cursor.runtime = cursor.prepared;
+	}
+	return {
+		toolCalls: outcome.toolCalls,
+		sequential: mustRunToolCallsInOrder(outcome.context, outcome.config, outcome.message, outcome.toolCalls),
+		ended: outcome.ended,
+	};
+}
+
+/**
+ * Run one recorded call of the current step. Returns undefined when the transcript already
+ * holds a result with the same call id. Concurrent dispatch admission belongs to the caller.
+ */
+export async function runAgentToolCall(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	toolCallId: string,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	cursor?: StepCursor,
+): Promise<TurnToolCallOutcome | undefined> {
+	const assistantMessage = lastAssistantMessage(context.messages);
+	// Call ids are unique only within one response, so only this step's results count.
+	if (assistantMessage && resultsAfter(context.messages, assistantMessage).has(toolCallId)) {
+		return undefined;
+	}
+
+	const toolCall = assistantMessage?.content.find(
+		(c): c is AgentToolCall => c.type === "toolCall" && c.id === toolCallId,
+	);
+	if (!assistantMessage || !toolCall) {
+		throw new Error(`No recorded tool call ${toolCallId} to run`);
+	}
+	if (!stillOpen(context.messages, assistantMessage)) {
+		throw new Error(`Cannot run call ${toolCallId}: a later message closed its step`);
+	}
+
+	// Against what preparation returned, when this step prepared. The tools of a step belong to the
+	// context and configuration that step's model call ran under, not to whatever the agent's state
+	// says now.
+	const stepContext = cursor?.prepared?.context ?? context;
+	const stepConfig = cursor?.prepared?.config ?? config;
+	return runTurnToolCall({
+		context: { ...stepContext, messages: stepMessages(cursor, context.messages) },
+		assistantMessage,
+		toolCall,
+		config: stepConfig,
+		signal,
+		emit,
+	});
+}
+
+/**
+ * Close the current step with the results of its calls, in the order the model asked for them.
+ * The step's message is the last assistant message, so a seal that runs twice finds the same
+ * one and records only what is missing. Pass `expectCalls` to say which step that has to be:
+ * anything appended between the model call and the seal moves the message the results would
+ * otherwise be attributed to, and on a durable driver those are separate units of work.
+ */
+export async function runAgentSeal(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	toolCalls: ReadonlyArray<TurnToolCallOutcome>,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	expectCalls?: ReadonlyArray<string>,
+	cursor?: StepCursor,
+): Promise<AgentStepOutcome> {
+	const message = lastAssistantMessage(context.messages);
+	if (!message) {
+		throw new Error("No assistant message to seal");
+	}
+
+	const recorded = message.content.filter((block) => block.type === "toolCall").map((call) => call.id);
+	if (expectCalls && !sameCalls(recorded, expectCalls)) {
+		throw new Error(
+			`Cannot seal: the last assistant message asked for [${recorded.join(", ")}], not [${expectCalls.join(", ")}]`,
+		);
+	}
+	const stray = toolCalls.find((call) => !recorded.includes(call.message.toolCallId));
+	if (stray) {
+		throw new Error(`Cannot seal: no call ${stray.message.toolCallId} in the message being closed`);
+	}
+
+	// A response that ended the run closed the turn as it went, so there is nothing left to
+	// record and nothing to decide. The caller still seals, because what happens after a
+	// failed model call (a retry, a compaction) is above the loop.
+	if (message.stopReason === "error" || message.stopReason === "aborted") {
+		// The run ends here, as it does in the loop. A retry is a new run and prepares from nothing.
+		if (cursor) clearCursor(cursor);
+		return { messages: [], hasMoreToolCalls: false, continueRequested: false };
+	}
+
+	// The batch is the step's calls in the model's order. A call the caller has no outcome for
+	// can already have its result in the transcript. A seal that ran before and lost its answer
+	// recorded it, and runToolCall() reports nothing for it now. Counting it keeps the decision
+	// the same as the first seal's. The transcript does not keep `terminate`, so such a result
+	// counts as one that asks for another step. AgentSession marks a turn its tools stopped and
+	// checks that before it seals, so only a caller of this function alone sees the extra step.
+	const provided = new Map(toolCalls.map((call) => [call.message.toolCallId, call]));
+	const existing = resultsAfter(context.messages, message);
+	const batch: TurnToolCallOutcome[] = [];
+	for (const call of message.content) {
+		if (call.type !== "toolCall") continue;
+		const outcome = provided.get(call.id);
+		const result = existing.get(call.id);
+		// The recorded result is the one the transcript and its listeners settled on, and a listener
+		// can have rewritten it. The outcome passed in still knows whether the tool asked to stop.
+		if (result) batch.push({ message: result, terminate: outcome?.terminate ?? false });
+		else if (outcome) batch.push(outcome);
+		// Nobody can say whether a call with neither ran. The step still closes, and the model is
+		// told the outcome is unknown, so the turn never ends with a call that has no result.
+		else batch.push(unknownToolCallOutcome(call));
+	}
+	// A result recorded after a message that closed the step pairs with nothing. A replay that has
+	// nothing left to record can still decide.
+	if (batch.some((call) => !existing.has(call.message.toolCallId)) && !stillOpen(context.messages, message)) {
+		throw new Error("Cannot seal: a later message closed the step");
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const stepContext = cursor?.prepared?.context ?? context;
+	const stepConfig = cursor?.prepared?.config ?? config;
+	const outcome = await sealTurnStep({
+		context: { ...stepContext, messages: stepMessages(cursor, context.messages) },
+		config: stepConfig,
+		newMessages,
+		message,
+		toolCalls: batch,
+		fetchNextPending: false,
+		signal,
+		emit,
+	});
+
+	if (cursor) {
+		// The step is closed, so what it prepared is spent and what it completed is what the next
+		// model call prepares from. A turn that ended takes the run with it.
+		if (outcome.done) clearCursor(cursor);
+		else {
+			cursor.previousTurn = outcome.completedTurn;
+			cursor.prepared = undefined;
+		}
+	}
+	return {
+		messages: newMessages,
+		hasMoreToolCalls: !outcome.done && outcome.hasMoreToolCalls,
+		continueRequested: !outcome.done && outcome.continueRequested,
+	};
+}
+
+/**
+ * The messages a stepped call runs against, the same ones the loop's own context holds. That is
+ * the history the last model call saw, which preparation can have pruned, and the messages the
+ * transcript gained after its response. The removed history does not come back. When the
+ * transcript no longer holds that response, something rewrote it, and the transcript is used.
+ */
+function stepMessages(cursor: StepCursor | undefined, transcript: AgentMessage[]): AgentMessage[] {
+	const kept = cursor?.runtime?.context.messages;
+	const response = kept?.[kept.length - 1];
+	const at = response ? transcript.lastIndexOf(response) : -1;
+	if (!kept || at < 0) return transcript;
+	return [...kept, ...transcript.slice(at + 1)];
+}
+
+function clearCursor(cursor: StepCursor): void {
+	cursor.previousTurn = undefined;
+	cursor.prepared = undefined;
+	cursor.runtime = undefined;
+}
+
+/**
+ * Whether `message` is still the open step. Its own results and system messages can follow it.
+ * Anything else reaches the provider as a user turn, which closes the calls before it.
+ */
+function stillOpen(messages: ReadonlyArray<AgentMessage>, message: AgentMessage): boolean {
+	for (let index = messages.lastIndexOf(message) + 1; index < messages.length; index++) {
+		const role = messages[index].role;
+		if (role !== "toolResult" && role !== "system") return false;
+	}
+	return true;
+}
+
+/** The results recorded after `message`, by call id. */
+function resultsAfter(messages: ReadonlyArray<AgentMessage>, message: AgentMessage): Map<string, ToolResultMessage> {
+	const results = new Map<string, ToolResultMessage>();
+	for (let index = messages.lastIndexOf(message) + 1; index < messages.length; index++) {
+		const entry = messages[index];
+		if (entry.role === "toolResult") results.set(entry.toolCallId, entry);
+	}
+	return results;
+}
+
+function sameCalls(a: ReadonlyArray<string>, b: ReadonlyArray<string>): boolean {
+	return a.length === b.length && a.every((id) => b.includes(id));
+}
+
+function lastAssistantMessage(messages: ReadonlyArray<AgentMessage>): AssistantMessage | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "assistant") {
+			return message;
+		}
+	}
+	return undefined;
 }
 
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
@@ -212,6 +547,13 @@ interface TurnModelCallParams {
 	// at the end would make the last turn of a run pay for a turn nobody asked for and would hand
 	// the stop decision a context it never saw.
 	previousTurn?: PrepareNextTurnContext;
+	/**
+	 * Called with what preparation returned, before the provider is asked anything. A model call
+	 * that fails after preparing has still prepared: the app's callback ran, and it is the kind of
+	 * callback that compacts a transcript. Recording it here is what lets the attempt that follows
+	 * reuse it instead of running it a second time.
+	 */
+	onPrepared?: (state: { readonly context: AgentContext; readonly config: AgentLoopConfig }) => void;
 	emitTurnStart: boolean;
 	signal: AbortSignal | undefined;
 	emit: AgentEventSink;
@@ -295,6 +637,8 @@ async function runTurnModelCall(params: TurnModelCallParams): Promise<TurnModelC
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 		}
 	}
+
+	params.onPrepared?.({ context, config });
 
 	if (params.emitTurnStart) {
 		await emit({ type: "turn_start" });
@@ -388,9 +732,17 @@ async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutco
 	const currentContext = params.context;
 	const config = params.config;
 
+	// A seal cut short can have recorded some of the results already, so each is checked on its
+	// own. The batch decides the turn either way: dropping a recorded result from the count
+	// would end a turn that has more to do.
+	// Only this step's results count. Call ids are unique within one response, not across a run.
+	const recorded = resultsAfter(currentContext.messages, message);
 	const toolResults: ToolResultMessage[] = [];
 	for (const call of params.toolCalls) {
 		toolResults.push(call.message);
+		if (recorded.has(call.message.toolCallId)) {
+			continue;
+		}
 		await emitToolResultMessage(call.message, emit);
 		currentContext.messages.push(call.message);
 		newMessages.push(call.message);
@@ -436,7 +788,8 @@ async function sealTurnStep(params: SealTurnStepParams): Promise<SingleTurnOutco
  * assistant response, run the tools it requests, and report whether the loop
  * should keep going.
  *
- * Three pieces, each of which stands on its own: the model call, one tool call, the seal.
+ * The three pieces are the same ones a caller stepping from outside drives, so a turn under
+ * an executor and a turn pi runs itself are one implementation.
  */
 async function runSingleTurn(params: SingleTurnParams): Promise<SingleTurnOutcome> {
 	const modelCall = await runTurnModelCall(params);

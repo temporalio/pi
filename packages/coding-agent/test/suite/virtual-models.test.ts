@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type FauxResponseStep, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "../../src/core/extensions/index.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import { type ModelRoute, type ModelRouteRequest, VIRTUAL_MODEL_STATE_ENTRY } from "../../src/core/virtual-models.ts";
 import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
 
@@ -144,6 +148,31 @@ describe("AgentSession virtual models", () => {
 		expect(reasons()).toEqual(["user", "retry"]);
 		expect(requests[1].failed?.model.id).toBe("large");
 		expect(requests[1].failed?.message.stopReason).toBe("length");
+	});
+
+	it("routes a stepped retry as a retry in a session reopened from its file", async () => {
+		const settings = { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } };
+		const sessionDir = mkdtempSync(join(tmpdir(), "pi-virtual-reopen-"));
+		const first = await createRoutedHarness(defaultRoute, {
+			settings,
+			sessionManager: SessionManager.create(sessionDir, sessionDir),
+		});
+		first.harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })]);
+		await first.harness.session.recordPrompt("hello");
+		await first.harness.session.modelCall();
+		expect(await first.harness.session.sealStep([])).toMatchObject({ done: false, retryAttempt: 1 });
+
+		// The next activity opens the same file in a process that never saw the failure.
+		const reopened = SessionManager.open(first.harness.sessionManager.getSessionFile()!);
+		const again = await createRoutedHarness(defaultRoute, { settings, sessionManager: reopened });
+		again.harness.session.agent.state.messages = reopened.buildSessionProjection().messages;
+		again.harness.setResponses([fauxAssistantMessage("done")]);
+		await again.harness.session.modelCall();
+
+		expect(again.reasons()).toEqual(["retry"]);
+		expect(again.requests[0].failed?.message.errorMessage).toBe("overloaded_error");
+		expect(again.requests[0].failed?.model.id).toBe("large");
+		rmSync(sessionDir, { recursive: true, force: true });
 	});
 
 	it("routes requests after extension messages as continuations", async () => {

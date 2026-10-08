@@ -367,7 +367,74 @@ export function parseSessionEntries(content: string): FileEntry[] {
 		}
 	}
 
-	return entries;
+	return dropIncompleteBatches(entries);
+}
+
+/** Marks every line of a multi-entry batch() write, so a reader can tell a whole batch from part of one. */
+interface BatchFrame {
+	id: string;
+	size: number;
+}
+
+function serializeEntries(entries: FileEntry[]): string {
+	return entries.map((e) => `${JSON.stringify(e)}\n`).join("");
+}
+
+function serializeBatch(entries: SessionEntry[]): string {
+	// One line is whole or dropped as malformed, so it needs no frame.
+	if (entries.length < 2) return serializeEntries(entries);
+	const batch: BatchFrame = { id: randomUUID(), size: entries.length };
+	return entries.map((e) => `${JSON.stringify({ ...e, batch })}\n`).join("");
+}
+
+function batchFrameOf(entry: FileEntry): Partial<BatchFrame> | undefined {
+	const frame = (entry as { batch?: unknown }).batch;
+	return frame && typeof frame === "object" ? frame : undefined;
+}
+
+/**
+ * Drop every run of batch() lines that holds fewer entries than its frame says, and strip the
+ * frame from the rest. A writer that died part way through a batch leaves such a run, and a
+ * later writer appends after it, so it is dropped wherever it sits, not only at the end.
+ */
+function dropIncompleteBatches(entries: FileEntry[]): FileEntry[] {
+	const kept: FileEntry[] = [];
+	const filter = createBatchFilter((entry) => kept.push(entry));
+	for (const entry of entries) filter.push(entry);
+	filter.end();
+	return kept;
+}
+
+/**
+ * dropIncompleteBatches() for a reader that gets one entry at a time. It holds back only the
+ * current batch, so a reader that streams a large file does not keep all of it in memory.
+ */
+function createBatchFilter(keep: (entry: FileEntry) => void) {
+	let run: FileEntry[] = [];
+	let frame: Partial<BatchFrame> | undefined;
+	const end = () => {
+		if (frame && run.length === frame.size) {
+			for (const entry of run) {
+				delete (entry as { batch?: unknown }).batch;
+				keep(entry);
+			}
+		}
+		run = [];
+		frame = undefined;
+	};
+	return {
+		push(entry: FileEntry) {
+			const entryFrame = batchFrameOf(entry);
+			if (frame && entryFrame?.id !== frame.id) end();
+			if (!entryFrame) {
+				keep(entry);
+				return;
+			}
+			frame ??= entryFrame;
+			run.push(entry);
+		},
+		end,
+	};
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -719,7 +786,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	}
 
 	if (pending) appendFileSync(resolvedFilePath, "\n");
-	return entries;
+	return dropIncompleteBatches(entries);
 }
 
 /**
@@ -868,6 +935,34 @@ async function buildSessionInfo(
 			crlfDelay: Infinity,
 		});
 
+		// The list shows only what opening the session shows.
+		const filter = createBatchFilter((entry) => {
+			// Extract session name (use latest, including explicit clears)
+			if (entry.type === "session_info") {
+				name = entry.name?.trim() || undefined;
+			}
+
+			if (entry.type !== "message") return;
+			messageCount++;
+
+			const activityTime = getMessageActivityTime(entry);
+			if (typeof activityTime === "number") {
+				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+			}
+
+			const message = entry.message;
+			if (!isMessageWithContent(message)) return;
+			if (message.role !== "user" && message.role !== "assistant") return;
+
+			const textContent = extractTextContent(message);
+			if (!textContent) return;
+
+			allMessages.push(textContent);
+			if (!firstMessage && message.role === "user") {
+				firstMessage = textContent;
+			}
+		});
+
 		for await (const line of rl) {
 			const entry = parseSessionEntryLine(line);
 			if (!entry) continue;
@@ -878,31 +973,9 @@ async function buildSessionInfo(
 				continue;
 			}
 
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
-			}
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
+			filter.push(entry);
 		}
+		filter.end();
 
 		if (!header) return null;
 
@@ -1052,6 +1125,11 @@ export class SessionManager {
 	private _writeGuard?: () => void;
 	// A failed append may have left part of a line at the end of the file.
 	private _cutTail = false;
+	// Entries appended inside batch(), held for its single write.
+	private _batch?: SessionEntry[];
+	// The batch of each entry held in memory before the file exists. A reopened session then
+	// shows all of a setup change or none of it, as it does for a later batch.
+	private _heldBatches = new WeakMap<FileEntry, object>();
 
 	private constructor(
 		cwd: string,
@@ -1226,16 +1304,27 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
+		this._persistEntries([entry], false);
+	}
+
+	/** `entries` are the tail of fileEntries. `batched` frames them as one batch() write. */
+	private _persistEntries(entries: SessionEntry[], batched: boolean): void {
+		if (!this.persist || !this.sessionFile || entries.length === 0) return;
+		const lines = batched ? serializeBatch(entries) : serializeEntries(entries);
 
 		if (!this.flushed) {
-			if (!this._hasConversation()) return;
+			if (!this._hasConversation()) {
+				if (batched) {
+					const batch = {};
+					for (const entry of entries) this._heldBatches.set(entry, batch);
+				}
+				return;
+			}
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				try {
-					for (const e of this.fileEntries) {
-						writeFileSync(fd, `${JSON.stringify(e)}\n`);
-					}
+					// One write, so a process that dies here leaves no part of the first entries behind.
+					writeFileSync(fd, this._serializeHeld(this.fileEntries.slice(0, -entries.length)) + lines);
 				} finally {
 					closeSync(fd);
 				}
@@ -1249,19 +1338,36 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			// An append that fails can leave part of its line. The next append ends that part with
-			// a newline first, so the loader skips it as one bad line and reads the retry's line
+			// An append that fails can leave part of its lines. The next append ends that part with
+			// a newline first, so the loader skips it as one bad line and reads the retry's lines
 			// whole. Never cut the file back. A writer the guard let through can still be in this
 			// write when a newer one appends, and a cut would erase what the newer one wrote.
 			const prefix = this._cutTail ? "\n" : "";
 			try {
-				appendFileSync(this.sessionFile, `${prefix}${JSON.stringify(entry)}\n`);
+				appendFileSync(this.sessionFile, `${prefix}${lines}`);
 			} catch (error) {
 				this._cutTail = true;
 				throw error;
 			}
 			this._cutTail = false;
 		}
+	}
+
+	/**
+	 * A branch can keep only part of a held batch, so each run is framed with the size it has.
+	 */
+	private _serializeHeld(entries: FileEntry[]): string {
+		let lines = "";
+		let i = 0;
+		while (i < entries.length) {
+			const batch = this._heldBatches.get(entries[i]);
+			let end = i + 1;
+			while (batch && end < entries.length && this._heldBatches.get(entries[end]) === batch) end++;
+			const run = entries.slice(i, end);
+			lines += batch ? serializeBatch(run as SessionEntry[]) : serializeEntries(run);
+			i = end;
+		}
+		return lines;
 	}
 
 	/** Whether the write guard still lets this process write. */
@@ -1283,11 +1389,52 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		if (this._batch) {
+			this._batch.push(entry);
+			return;
+		}
 		try {
 			this._persist(entry);
 		} catch (error) {
 			this.fileEntries.pop();
 			this.byId.delete(entry.id);
+			this.leafId = leafBefore;
+			throw error;
+		}
+	}
+
+	/**
+	 * Run `write` and put every entry it appends in the file with one write. A failure takes them
+	 * all back out of memory too. Readers see the entries as soon as they are appended. A call
+	 * inside a batch joins it.
+	 *
+	 * The file gets all of the entries or, as far as a later load can tell, none. The write can
+	 * still land part way when the process dies or power goes, since the OS may take it in more
+	 * than one piece. So each line of a batch of two or more entries carries a `batch` frame with
+	 * the batch's id and size, and the loader drops a batch with fewer lines than its size. Such a
+	 * batch stays in the file and is dropped on every load. Single entries carry no frame, since a
+	 * cut line is dropped as malformed anyway.
+	 */
+	batch<T>(write: () => T): T {
+		if (this._batch) return write();
+		const batch: SessionEntry[] = [];
+		const leafBefore = this.leafId;
+		this._batch = batch;
+		try {
+			const result = write();
+			this._batch = undefined;
+			// Asked again right before the write. Time passes while the batch is built, and the
+			// guard has to answer for the moment the entries reach the file.
+			if (batch.length > 0) this._writeGuard?.();
+			this._persistEntries(batch, true);
+			return result;
+		} catch (error) {
+			this._batch = undefined;
+			this.fileEntries.splice(this.fileEntries.length - batch.length, batch.length);
+			// Append methods also update derived state, such as labels. Rebuilt from what the file
+			// holds, so none of it outlives the rolled-back entries. The leaf can be off the end of
+			// the file after a branch, so it goes back to what it was.
+			this._buildIndex();
 			this.leafId = leafBefore;
 			throw error;
 		}
