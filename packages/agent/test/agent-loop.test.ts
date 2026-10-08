@@ -95,7 +95,7 @@ function createEchoTool(executed: string[] = []): AgentTool<typeof echoSchema, {
 function twoEchoCallsThenStop(stopReason: "toolUse" | "length") {
 	let callIndex = 0;
 	return () => {
-		const stream = new MockAssistantStream();
+		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
 			const first = callIndex++ === 0;
 			const reason = first ? stopReason : "stop";
