@@ -22,6 +22,7 @@ import {
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentModelCallOutcome,
 	type AgentState,
 	type AgentStepOutcome,
 	type AgentTool,
@@ -98,6 +99,7 @@ import {
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
+	type ModelCallOptions,
 	type ReplacedSessionContext,
 	type SealStepOptions,
 	type SealStepResult,
@@ -1951,7 +1953,10 @@ export class AgentSession {
 		const steps: TurnSteps = {
 			record,
 			interrupted: () => this.agent.interrupted,
-			modelCall: async () => ({ ...(await this.agent.modelCall()), stepId: this._currentStepId() }),
+			modelCall: async (options) => ({
+				...(await this._modelCallUntil(options?.signal)),
+				stepId: this._currentStepId(),
+			}),
 			runToolCall: async (toolCallId, options) => {
 				this._refuseStaleStep(options?.stepId, `run call ${toolCallId}`);
 				return this._runToolCallUntil(toolCallId, options?.signal);
@@ -2272,25 +2277,42 @@ export class AgentSession {
 	 * The run stays open until sealStep() closes it, so the three calls are one step and not
 	 * three. A response the transcript already holds is reported again without a model call,
 	 * which is the answer a caller that lost its record of the call gets back.
+	 *
+	 * When `options.signal` aborts, the call stops the way a user stop does and reports the
+	 * aborted response with `ended: true`. A signal already aborted throws and asks nothing.
 	 */
-	async modelCall(): Promise<SteppedModelCall> {
+	async modelCall(options: ModelCallOptions = {}): Promise<SteppedModelCall> {
 		if (this._isAgentRunActive) {
 			// Not "the response ended the run". A caller told that seals a step it never opened,
 			// which closes the previous one a second time.
 			throw new Error("Agent is already processing. Wait for completion before stepping.");
 		}
+		// Before the run is marked active, so a refused call leaves nothing to settle.
+		if (options.signal?.aborted) throw options.signal.reason ?? new Error("model call was stopped before it ran");
 
 		this._agentRunAbortRequested = false;
 		this._isAgentRunActive = true;
 		this._restoreTurnPromptOptions();
 		try {
-			const outcome = await this.agent.modelCall();
+			const outcome = await this._modelCallUntil(options.signal);
 			return { ...outcome, stepId: this._currentStepId() };
 		} catch (error) {
 			// The step never opened, so nothing is left to seal and the run must not stay marked
 			// as active.
 			await this._emitAgentSettled();
 			throw error;
+		}
+	}
+
+	/** The model call, aborted like a user stop when `signal` aborts. A signal already aborted asks nothing. */
+	private async _modelCallUntil(signal: AbortSignal | undefined): Promise<AgentModelCallOutcome> {
+		if (signal?.aborted) throw signal.reason ?? new Error("model call was stopped before it ran");
+		const stop = () => this.agent.abort();
+		signal?.addEventListener("abort", stop, { once: true });
+		try {
+			return await this.agent.modelCall();
+		} finally {
+			signal?.removeEventListener("abort", stop);
 		}
 	}
 

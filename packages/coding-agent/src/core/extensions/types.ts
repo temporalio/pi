@@ -1513,7 +1513,12 @@ export interface TurnSteps {
 	 * a driver has more units after it, so it has to stop asking for them itself.
 	 */
 	interrupted(): boolean;
-	modelCall(): Promise<SteppedModelCall>;
+	/**
+	 * The model call of the next step. When `options.signal` aborts, the call stops the way a user
+	 * stop does and reports the aborted response with `ended: true`. A signal already aborted
+	 * throws and starts no model call.
+	 */
+	modelCall(options?: ModelCallOptions): Promise<SteppedModelCall>;
 	/** Undefined when the transcript already held a result for the call, so nothing ran. */
 	runToolCall(toolCallId: string, options?: StepCallOptions): Promise<TurnToolCallOutcome | undefined>;
 	sealStep(results: ReadonlyArray<TurnToolCallOutcome>, options?: SealStepOptions): Promise<SealStepResult>;
@@ -1536,6 +1541,15 @@ export interface StepCallOptions {
 	/**
 	 * Stops the call the way a user stop does. A driver whose unit of work was cancelled passes its
 	 * own signal, so the tool ends and reports what it did instead of running on unseen.
+	 */
+	signal?: AbortSignal;
+}
+
+export interface ModelCallOptions {
+	/**
+	 * Stops the model call the way a user stop does. A driver whose unit of work was cancelled
+	 * passes its own signal, so the provider request ends instead of running on, billed and unseen.
+	 * There is no `stepId`, because the model call is what opens the step.
 	 */
 	signal?: AbortSignal;
 }
