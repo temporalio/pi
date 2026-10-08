@@ -978,6 +978,39 @@ describe("stepped turn", () => {
 		expect(seen[0]?.errorMessage).toBe(overloaded.errorMessage);
 	});
 
+	it("refuses a second seal of the step while the first one settles", async () => {
+		const extension = `export default p => p.on("agent_before_settle", async () => {
+			globalThis.settleEntered?.();
+			await new Promise((resolve) => { globalThis.releaseSettle = resolve; });
+			return { entries: [{ type: "custom", customType: "settle-note", data: {} }] };
+		});`;
+		const globals = globalThis as typeof globalThis & {
+			settleEntered?: () => void;
+			releaseSettle?: () => void;
+		};
+		const entered = new Promise<void>((resolve) => {
+			globals.settleEntered = resolve;
+		});
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const harness = await createSession("overlapping-seals", { responses, extension });
+		await harness.session.recordPrompt("go");
+		const { stepId } = await harness.session.modelCall();
+
+		const first = harness.session.sealStep([], { stepId });
+		await entered;
+		await expect(harness.session.sealStep([], { stepId })).rejects.toThrow("another seal");
+		globals.releaseSettle?.();
+		expect((await first).done).toBe(true);
+		delete globals.settleEntered;
+		delete globals.releaseSettle;
+
+		const notes = SessionManager.open(harness.sessionManager.getSessionFile()!)
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "settle-note");
+		expect(notes).toHaveLength(1);
+		expect(harness.session.isStreaming).toBe(false);
+	});
+
 	it("continues as the first seal decided when a reopened seal runs again", async () => {
 		const extension = `export default p => {
 			p.on("turn_end", () => {

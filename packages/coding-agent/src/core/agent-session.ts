@@ -501,6 +501,8 @@ export class AgentSession {
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	// True while a stepped seal finishes its turn. Only a seal can finish the same turn twice.
 	private _sealingStep = false;
+	// Held by a seal from its start until it has settled.
+	private _sealInFlight = false;
 	// What the last finishTurn decided, for a stepped turn: the loop acts on the decision itself,
 	// but a seal only reports whether the turn is done.
 	private _turnContinueRequested = false;
@@ -2039,9 +2041,15 @@ export class AgentSession {
 			},
 			// The run window is `_drive`'s, so the seal here decides and does not settle the run.
 			sealStep: async (results, options) => {
-				const sealed = await this._sealStep(results, options);
-				if (sealed.done) completed = true;
-				return sealed;
+				this._refuseOverlappingSeal();
+				this._sealInFlight = true;
+				try {
+					const sealed = await this._sealStep(results, options);
+					if (sealed.done) completed = true;
+					return sealed;
+				} finally {
+					this._sealInFlight = false;
+				}
 			},
 		};
 		// Inside the guarded part, because the session can already be held for this turn. A start
@@ -2510,6 +2518,9 @@ export class AgentSession {
 		if (this.agent.state.isStreaming) {
 			throw new Error("Agent is already processing. Wait for completion before stepping.");
 		}
+		// Refused before it takes the session, so the seal that holds the claim keeps it.
+		this._refuseOverlappingSeal();
+		this._sealInFlight = true;
 		// Busy until the seal settles, also when this process did not open the step, so a prompt
 		// sent while turn_end handlers run queues instead of being refused.
 		this._isAgentRunActive = true;
@@ -2522,8 +2533,20 @@ export class AgentSession {
 			sealed = true;
 			return result;
 		} finally {
-			await this._settleRun(done, sealed);
+			try {
+				await this._settleRun(done, sealed);
+			} finally {
+				this._sealInFlight = false;
+			}
 		}
+	}
+
+	/**
+	 * One seal at a time, until it has settled. Its handlers run after the agent stops streaming,
+	 * and a second seal of the same step would write their entries again.
+	 */
+	private _refuseOverlappingSeal(): void {
+		if (this._sealInFlight) throw new Error("Cannot seal: another seal is still settling");
 	}
 
 	/**
