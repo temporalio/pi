@@ -2016,7 +2016,7 @@ export class AgentSession {
 			modelCall: async () => ({ ...(await this.agent.modelCall()), stepId: this._currentStepId() }),
 			runToolCall: async (toolCallId, options) => {
 				this._refuseStaleStep(options?.stepId, `run call ${toolCallId}`);
-				return this.agent.runToolCall(toolCallId);
+				return this._runToolCallUntil(toolCallId, options?.signal);
 			},
 			// The run window is `_drive`'s, so the seal here decides and does not settle the run.
 			sealStep: (results, options) => this._sealStep(results, options),
@@ -2378,6 +2378,21 @@ export class AgentSession {
 	 *
 	 * Undefined means the transcript already held a result for the call, so nothing ran.
 	 */
+	/** Run one call, aborted like a user stop when `signal` aborts. A signal already aborted runs nothing. */
+	private async _runToolCallUntil(
+		toolCallId: string,
+		signal: AbortSignal | undefined,
+	): Promise<TurnToolCallOutcome | undefined> {
+		if (signal?.aborted) throw signal.reason ?? new Error(`call ${toolCallId} was stopped before it ran`);
+		const stop = () => this.agent.abort();
+		signal?.addEventListener("abort", stop, { once: true });
+		try {
+			return await this.agent.runToolCall(toolCallId);
+		} finally {
+			signal?.removeEventListener("abort", stop);
+		}
+	}
+
 	async runToolCall(toolCallId: string, options: StepCallOptions = {}): Promise<TurnToolCallOutcome | undefined> {
 		this._refuseStaleStep(options.stepId, `run call ${toolCallId}`);
 		// A tool can read the system prompt, and this can be the first thing a process does.
@@ -2388,7 +2403,7 @@ export class AgentSession {
 		const opened = !this._isAgentRunActive;
 		this._isAgentRunActive = true;
 		try {
-			return await this.agent.runToolCall(toolCallId);
+			return await this._runToolCallUntil(toolCallId, options.signal);
 		} finally {
 			// No settle follows a tool call here, and options left behind would outlive the turn
 			// when its seal runs somewhere else.
