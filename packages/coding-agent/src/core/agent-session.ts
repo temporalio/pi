@@ -2120,6 +2120,29 @@ export class AgentSession {
 		return last ? this._findPersistedMessageEntryId(last) : undefined;
 	}
 
+	/**
+	 * Whether the file says the settle boundary already ran for the step, so a seal settled the
+	 * turn. Read from the file, by the step's own entry, since the boundary can take the step
+	 * out of what the model sees. Without a step id, the step is the file's last response.
+	 */
+	private _settledStep(stepId: string | undefined): boolean {
+		const branch = this.sessionManager.getBranch();
+		const isResponse = (entry: SessionEntry) => {
+			if (entry.type !== "message") return false;
+			return entry.message.role === "assistant";
+		};
+		const step = stepId ?? branch.findLast(isResponse)?.id;
+		if (!step) return false;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.id === step) return false;
+			if (entry.type !== "custom" || entry.customType !== SETTLE_DISPATCHED_ENTRY) continue;
+			const named = (entry.data as { messageEntryId?: string } | undefined)?.messageEntryId;
+			if (named === step) return true;
+		}
+		return false;
+	}
+
 	/** Refuse a caller whose step is over. Its call id can name a call of the next step. */
 	private _refuseStaleStep(stepId: string | undefined, what: string): void {
 		if (stepId === undefined || stepId === this._currentStepId()) return;
@@ -2519,6 +2542,16 @@ export class AgentSession {
 	): Promise<SealStepResult> {
 		// turn_end handlers and a compaction after the seal can read the system prompt.
 		this._restoreTurnPromptOptions();
+		// A seal that already settled the turn ended it, and that answer is final. Its boundary
+		// can then edit or compact what the model sees, so the checks below would read the step
+		// from a transcript the turn already rewrote.
+		if (this._settledStep(options.stepId)) {
+			return {
+				done: true,
+				retryAttempt: options.retryAttempt ?? 0,
+				overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
+			};
+		}
 		const replayed = this._replayRecoverySeal(options);
 		if (replayed) return replayed;
 		// A seal that already ended the turn because its tools asked it to stop. The transcript

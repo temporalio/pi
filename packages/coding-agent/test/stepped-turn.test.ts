@@ -909,6 +909,41 @@ describe("stepped turn", () => {
 		expect(notes).toHaveLength(1);
 	});
 
+	it("replays a settled seal as done when agent_before_settle took the response out", async () => {
+		const extension = `export default p => p.on("agent_before_settle", (_event, ctx) => {
+			const step = ctx.sessionManager
+				.getBranch()
+				.findLast((e) => e.type === "message" && e.message.role === "assistant");
+			return { entries: [{ type: "context_edit", targetId: step.id, replacement: null }] };
+		});`;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("settled-edit", { responses, extension });
+		await first.session.recordPrompt("go");
+		const { stepId } = await first.session.modelCall();
+		const sealed = await first.session.sealStep([], { stepId });
+		expect(sealed).toMatchObject({ done: true, overflowRecoveryAttempted: false });
+
+		const again = await reopen(first, "settled-edit-again", { responses, extension });
+		const replayed = await again.session.sealStep([], { stepId });
+		expect(replayed).toMatchObject({ done: true, overflowRecoveryAttempted: false });
+		expect(again.asked()).toBe(0);
+	});
+
+	it("replays a settled seal as done when agent_before_settle compacted the turn", async () => {
+		const extension = `export default p => p.on("agent_before_settle", () => ({
+			entries: [{ type: "compaction", summary: "all of it", firstKeptEntryId: null }],
+		}));`;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("settled-compact", { responses, extension });
+		await first.session.recordPrompt("go");
+		const { stepId } = await first.session.modelCall();
+		expect((await first.session.sealStep([], { stepId })).done).toBe(true);
+
+		const again = await reopen(first, "settled-compact-again", { responses, extension });
+		expect((await again.session.sealStep([], { stepId })).done).toBe(true);
+		expect(again.asked()).toBe(0);
+	});
+
 	it("continues as the first seal decided when a reopened seal runs again", async () => {
 		const extension = `export default p => {
 			p.on("turn_end", () => {
