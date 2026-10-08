@@ -301,6 +301,26 @@ describe("SessionManager: a batch cut short on disk", () => {
 		expect(SessionManager.open(manager.getSessionFile()!).getEntries()).toEqual(manager.getEntries());
 	});
 
+	it("frames a batch held in memory until the session's first write", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		manager.batch(() => {
+			manager.appendModelChange("anthropic", "claude-opus-5-5");
+			manager.appendThinkingLevelChange("high");
+		});
+		manager.appendCustomEntry("setup", { n: 0 });
+		manager.appendMessage(user("one"));
+		const file = manager.getSessionFile()!;
+		const lines = fileLines(file);
+		expect(lines.map((e) => Boolean(e.batch))).toEqual([false, true, true, false, false]);
+
+		// Cut the file after the model change, as a power loss in the first write can.
+		const raw = readFileSync(file, "utf8").split("\n");
+		writeFileSync(file, `${raw.slice(0, 2).join("\n")}\n`);
+		const reopened = SessionManager.open(file);
+		expect(reopened.getEntries()).toEqual([]);
+		expect(reopened.buildSessionContext().model).toBeNull();
+	});
+
 	it("leaves single appends and one-entry batches unframed", () => {
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
 		manager.appendMessage(user("one"));

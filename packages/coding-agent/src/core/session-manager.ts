@@ -1103,6 +1103,9 @@ export class SessionManager {
 	private _cutTail = false;
 	// Entries appended inside batch(), held for its single write.
 	private _batch?: SessionEntry[];
+	// The batch of each entry held in memory before the file exists. A reopened session then
+	// shows all of a setup change or none of it, as it does for a later batch.
+	private _heldBatches = new WeakMap<FileEntry, object>();
 
 	private constructor(
 		cwd: string,
@@ -1286,12 +1289,18 @@ export class SessionManager {
 		const lines = batched ? serializeBatch(entries) : serializeEntries(entries);
 
 		if (!this.flushed) {
-			if (!this._hasConversation()) return;
+			if (!this._hasConversation()) {
+				if (batched) {
+					const batch = {};
+					for (const entry of entries) this._heldBatches.set(entry, batch);
+				}
+				return;
+			}
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				try {
 					// One write, so a process that dies here leaves no part of the first entries behind.
-					writeFileSync(fd, serializeEntries(this.fileEntries.slice(0, -entries.length)) + lines);
+					writeFileSync(fd, this._serializeHeld(this.fileEntries.slice(0, -entries.length)) + lines);
 				} finally {
 					closeSync(fd);
 				}
@@ -1318,6 +1327,23 @@ export class SessionManager {
 			}
 			this._cutTail = false;
 		}
+	}
+
+	/**
+	 * A branch can keep only part of a held batch, so each run is framed with the size it has.
+	 */
+	private _serializeHeld(entries: FileEntry[]): string {
+		let lines = "";
+		let i = 0;
+		while (i < entries.length) {
+			const batch = this._heldBatches.get(entries[i]);
+			let end = i + 1;
+			while (batch && end < entries.length && this._heldBatches.get(entries[end]) === batch) end++;
+			const run = entries.slice(i, end);
+			lines += batch ? serializeBatch(run as SessionEntry[]) : serializeEntries(run);
+			i = end;
+		}
+		return lines;
 	}
 
 	/** Whether the write guard still lets this process write. */
