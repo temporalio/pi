@@ -24,7 +24,6 @@ import {
 	rmSync,
 	type Stats,
 	statSync,
-	truncateSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -1051,6 +1050,8 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private _writeGuard?: () => void;
+	// A failed append may have left part of a line at the end of the file.
+	private _cutTail = false;
 
 	private constructor(
 		cwd: string,
@@ -1241,24 +1242,35 @@ export class SessionManager {
 			} catch (error) {
 				// This call created the file, so a part of it is ours to remove. Left in place, it
 				// makes every retry fail to create the file, and the session can never be written.
-				rmSync(this.sessionFile, { force: true });
+				// Only while this process may still write. Once the guard refuses, another writer
+				// can own the file and have written to it, and removing it would lose that.
+				if (this._mayStillWrite()) rmSync(this.sessionFile, { force: true });
 				throw error;
 			}
 			this.flushed = true;
 		} else {
-			// An append that fails can still leave part of its line. Cut the file back, or the
-			// retry's line joins that part and the loader drops both as one bad line.
-			const size = statSync(this.sessionFile).size;
+			// An append that fails can leave part of its line. The next append ends that part with
+			// a newline first, so the loader skips it as one bad line and reads the retry's line
+			// whole. Never cut the file back. A writer the guard let through can still be in this
+			// write when a newer one appends, and a cut would erase what the newer one wrote.
+			const prefix = this._cutTail ? "\n" : "";
 			try {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				appendFileSync(this.sessionFile, `${prefix}${JSON.stringify(entry)}\n`);
 			} catch (error) {
-				try {
-					truncateSync(this.sessionFile, size);
-				} catch {
-					// The append's own error is the one the caller needs.
-				}
+				this._cutTail = true;
 				throw error;
 			}
+			this._cutTail = false;
+		}
+	}
+
+	/** Whether the write guard still lets this process write. */
+	private _mayStillWrite(): boolean {
+		try {
+			this._writeGuard?.();
+			return true;
+		} catch {
+			return false;
 		}
 	}
 

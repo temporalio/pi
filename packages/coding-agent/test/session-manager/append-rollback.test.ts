@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-const state = vi.hoisted(() => ({ failNextAppend: false, failNextWrite: false, tearNextAppend: false }));
+const state = vi.hoisted(() => ({
+	failNextAppend: false,
+	failNextWrite: false,
+	tearNextAppend: false,
+	// Runs inside a failing append, before it throws, as a stalled write while a newer writer
+	// takes over.
+	duringFailedAppend: undefined as (() => void) | undefined,
+}));
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
@@ -21,6 +28,9 @@ vi.mock("node:fs", async (importOriginal) => {
 		appendFileSync: ((...args: Parameters<typeof actual.appendFileSync>) => {
 			if (state.failNextAppend) {
 				state.failNextAppend = false;
+				const during = state.duringFailedAppend;
+				state.duringFailedAppend = undefined;
+				during?.();
 				throw new Error("disk said no");
 			}
 			if (state.tearNextAppend) {
@@ -89,7 +99,7 @@ describe("SessionManager: a failed append", () => {
 		expect(ids).toEqual([first]);
 	});
 
-	it("cuts off the part of a line a failed append left, so the retry is read back", () => {
+	it("ends the part of a line a failed append left, so the retry is read back", () => {
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
 		const first = manager.appendMessage(user("one"));
 
@@ -102,5 +112,37 @@ describe("SessionManager: a failed append", () => {
 			.filter((entry) => entry.type === "message")
 			.map((entry) => entry.id);
 		expect(ids).toEqual([first, second]);
+	});
+
+	it("keeps what a newer writer appended while a stale append failed", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		const first = manager.appendMessage(user("one"));
+		const file = manager.getSessionFile()!;
+
+		let newer: string | undefined;
+		state.failNextAppend = true;
+		state.duringFailedAppend = () => {
+			newer = SessionManager.open(file).appendMessage(user("newer"));
+		};
+		expect(() => manager.appendMessage(user("stale"))).toThrow("disk said no");
+
+		const ids = SessionManager.open(file)
+			.getBranch()
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.id);
+		expect(ids).toEqual([first, newer]);
+	});
+
+	it("keeps a failed first write once the guard refuses, since another writer may own it", () => {
+		const manager = SessionManager.create(dir, join(dir, "sessions"));
+		let checks = 0;
+		manager.setWriteGuard(() => {
+			checks++;
+			if (checks > 1) throw new Error("superseded");
+		});
+
+		state.failNextWrite = true;
+		expect(() => manager.appendMessage(user("one"))).toThrow("disk said no");
+		expect(existsSync(manager.getSessionFile()!)).toBe(true);
 	});
 });
