@@ -367,7 +367,56 @@ export function parseSessionEntries(content: string): FileEntry[] {
 		}
 	}
 
-	return entries;
+	return dropIncompleteBatches(entries);
+}
+
+/** Marks every line of a multi-entry batch() write, so a reader can tell a whole batch from part of one. */
+interface BatchFrame {
+	id: string;
+	size: number;
+}
+
+function serializeEntries(entries: FileEntry[]): string {
+	return entries.map((e) => `${JSON.stringify(e)}\n`).join("");
+}
+
+function serializeBatch(entries: SessionEntry[]): string {
+	// One line is whole or dropped as malformed, so it needs no frame.
+	if (entries.length < 2) return serializeEntries(entries);
+	const batch: BatchFrame = { id: randomUUID(), size: entries.length };
+	return entries.map((e) => `${JSON.stringify({ ...e, batch })}\n`).join("");
+}
+
+function batchFrameOf(entry: FileEntry): Partial<BatchFrame> | undefined {
+	const frame = (entry as { batch?: unknown }).batch;
+	return frame && typeof frame === "object" ? frame : undefined;
+}
+
+/**
+ * Drop every run of batch() lines that holds fewer entries than its frame says, and strip the
+ * frame from the rest. A writer that died part way through a batch leaves such a run, and a
+ * later writer appends after it, so it is dropped wherever it sits, not only at the end.
+ */
+function dropIncompleteBatches(entries: FileEntry[]): FileEntry[] {
+	const kept: FileEntry[] = [];
+	let i = 0;
+	while (i < entries.length) {
+		const frame = batchFrameOf(entries[i]);
+		if (!frame) {
+			kept.push(entries[i++]);
+			continue;
+		}
+		let end = i + 1;
+		while (end < entries.length && batchFrameOf(entries[end])?.id === frame.id) end++;
+		if (end - i === frame.size) {
+			for (const entry of entries.slice(i, end)) {
+				delete (entry as { batch?: unknown }).batch;
+				kept.push(entry);
+			}
+		}
+		i = end;
+	}
+	return kept;
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -719,7 +768,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	}
 
 	if (pending) appendFileSync(resolvedFilePath, "\n");
-	return entries;
+	return dropIncompleteBatches(entries);
 }
 
 /**
@@ -1228,11 +1277,13 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
-		this._persistEntries([entry]);
+		this._persistEntries([entry], false);
 	}
 
-	private _persistEntries(entries: SessionEntry[]): void {
+	/** `entries` are the tail of fileEntries. `batched` frames them as one batch() write. */
+	private _persistEntries(entries: SessionEntry[], batched: boolean): void {
 		if (!this.persist || !this.sessionFile || entries.length === 0) return;
+		const lines = batched ? serializeBatch(entries) : serializeEntries(entries);
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
@@ -1240,7 +1291,7 @@ export class SessionManager {
 			try {
 				try {
 					// One write, so a process that dies here leaves no part of the first entries behind.
-					writeFileSync(fd, this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join(""));
+					writeFileSync(fd, serializeEntries(this.fileEntries.slice(0, -entries.length)) + lines);
 				} finally {
 					closeSync(fd);
 				}
@@ -1260,7 +1311,6 @@ export class SessionManager {
 			// write when a newer one appends, and a cut would erase what the newer one wrote.
 			const prefix = this._cutTail ? "\n" : "";
 			try {
-				const lines = entries.map((e) => `${JSON.stringify(e)}\n`).join("");
 				appendFileSync(this.sessionFile, `${prefix}${lines}`);
 			} catch (error) {
 				this._cutTail = true;
@@ -1304,12 +1354,16 @@ export class SessionManager {
 	}
 
 	/**
-	 * Run `write` and put every entry it appends in the file with one write, so a process that
-	 * dies part way leaves all of them or none. A failure takes them all back out of memory too.
-	 * Readers see the entries as soon as they are appended. A call inside a batch joins it.
+	 * Run `write` and put every entry it appends in the file with one write. A failure takes them
+	 * all back out of memory too. Readers see the entries as soon as they are appended. A call
+	 * inside a batch joins it.
 	 *
-	 * One append of a few lines is all-or-nothing when a process dies. A power loss can still
-	 * cut the last line, and the loader drops a cut line, so order the entries with that in mind.
+	 * The file gets all of the entries or, as far as a later load can tell, none. The write can
+	 * still land part way when the process dies or power goes, since the OS may take it in more
+	 * than one piece. So each line of a batch of two or more entries carries a `batch` frame with
+	 * the batch's id and size, and the loader drops a batch with fewer lines than its size. Such a
+	 * batch stays in the file and is dropped on every load. Single entries carry no frame, since a
+	 * cut line is dropped as malformed anyway.
 	 */
 	batch<T>(write: () => T): T {
 		if (this._batch) return write();
@@ -1322,7 +1376,7 @@ export class SessionManager {
 			// Asked again right before the write. Time passes while the batch is built, and the
 			// guard has to answer for the moment the entries reach the file.
 			if (batch.length > 0) this._writeGuard?.();
-			this._persistEntries(batch);
+			this._persistEntries(batch, true);
 			return result;
 		} catch (error) {
 			this._batch = undefined;
