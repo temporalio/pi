@@ -27,9 +27,11 @@ import {
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	declareToolChanges,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
+	unknownToolCallOutcome,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -125,7 +127,9 @@ import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type ContextEditEntry,
+	findDanglingToolCalls,
 	getLatestCompactionEntry,
+	isOutsideToolPairing,
 	type SessionEntry,
 	SessionManager,
 	type SessionProjection,
@@ -371,6 +375,14 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+const UNSETTLED_CALLS_MESSAGE = "Tool calls have no result. Call prepareStep() first.";
+// Names the result a turn ended on when its tools asked it to stop. A transcript that ends on a
+// result otherwise reads as a turn with more to do.
+const TURN_ENDED_ON_RESULT_ENTRY = "pi.turn-ended-on-result";
+const BUILD_BUSY_MESSAGE = "Agent is already processing. Wait for completion before prompting.";
+const COMPACTING_MESSAGE =
+	"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.";
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -386,6 +398,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	// A prompt is between its first build step that changes shared state and its claim.
+	private _buildingPrompt = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -398,6 +412,7 @@ export class AgentSession {
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
+	private _isFlushingCustomMessages = false;
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -427,6 +442,9 @@ export class AgentSession {
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastAssistantToolResults: AgentMessage[] = [];
+	// The last response this run handled after its loop ended. Only a response that asked for
+	// tools can end the turn on their results, so this tells a terminate from an omitted reply.
+	private _runFinalResponse: AssistantMessage | undefined;
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
@@ -1142,27 +1160,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
-			let entryId: string | undefined;
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				entryId = this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "system" ||
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				entryId = this.sessionManager.appendMessage(event.message);
-			}
-			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._persistMessage(event.message);
 
 			if (event.message.role === "assistant") {
 				const assistantMsg = event.message as AssistantMessage;
@@ -1820,34 +1818,247 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._drive(() => this.agent.prompt(messages));
+	}
+
+	/** Run a turn to its end: the first run, then whatever post-run handling asks for. */
+	private async _drive(initial: () => Promise<void>): Promise<void> {
+		this._isAgentRunActive = true;
+		// Inside the guarded part, because the session can already be held for this turn. A start
+		// that fails has to give it back, or the session stays busy for good.
+		try {
+			this._beginTurn();
+			await initial();
+			for (;;) {
+				while (!this._agentRunAbortRequested) {
+					if (await this._handlePostAgentRun()) {
+						if (this._agentRunAbortRequested) break;
+						await this.agent.continue();
+						continue;
+					}
+					if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+					if (this._agentRunAbortRequested) break;
+					await this.agent.continue();
+				}
+				// Only a run that finished. A stopped or failed one can also end on a result, and
+				// that turn still has work.
+				if (this._agentRunAbortRequested) break;
+				const queued = this.agent.peekQueuedMessages().length;
+				const marked = this._markTurnEndedOnResult();
+				// A subscriber to the marker can queue a turn, and the run is still the one to take
+				// it. Left queued, it waits for a prompt that may never come, while the marker tells
+				// a driver there's no work. Only what the marker's subscribers queued, though. What
+				// was queued before, the run's own checks already chose to leave.
+				if (this._agentRunAbortRequested || !marked) break;
+				if (this.agent.peekQueuedMessages().length <= queued) break;
+				await this.agent.continue();
+			}
+		} finally {
+			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = undefined;
+			await this._settleRun();
+		}
+	}
+
+	/** What a turn starts with, before anything of it reaches the transcript. */
+	private _beginTurn(): void {
 		this._agentRunAbortRequested = false;
+		this._runFinalResponse = undefined;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
 		// The run records the loadout in the transcript; restored tools that did not register by now
 		// are dropped, so a tool that never registers does not stay pending.
 		this._pendingToolNames.clear();
+	}
+
+	/** What every run ends with. */
+	private async _settleRun(): Promise<void> {
+		this._runSystemPromptOptions = undefined;
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		await this._emitAgentSettled();
+	}
+
+	/**
+	 * Settle what a stopped turn left behind, without calling the model: tool calls with no
+	 * result get one, and a trailing assistant message that holds no answer is dropped.
+	 * Returns whether the turn still has work, so false means it already has its answer. A
+	 * transcript that ends on anything the model has not answered has work, a custom message
+	 * or a bash execution included. Returns `"busy"` while a run is active, having looked at
+	 * nothing, because neither answer is known then. Mind that `"busy"` is truthy: a caller
+	 * that treats the result as a boolean reads busy as has-work.
+	 *
+	 * A driver calls this before its next model call, so recovery is a step like any other.
+	 */
+	prepareStep(): boolean | "busy" {
+		// Compaction writes the transcript the way a run does.
+		if (this._isAgentRunActive || this.isCompacting) {
+			return "busy";
+		}
+		// Busy while it settles, the same as a run. A subscriber that reacts to a settled result
+		// would otherwise see a transcript that is only part settled. Calling back in here would
+		// settle the calls again, and a turn it starts would answer the part it saw. While busy,
+		// both are refused or queued, as they are during a run.
 		this._isAgentRunActive = true;
+		let settled = false;
 		try {
-			await this.agent.prompt(messages);
-			while (!this._agentRunAbortRequested) {
-				if (await this._handlePostAgentRun()) {
-					if (this._agentRunAbortRequested) break;
-					await this.agent.continue();
-					continue;
-				}
-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
-				if (this._agentRunAbortRequested) break;
-				await this.agent.continue();
+			this._settleStoppedTurn();
+			settled = true;
+		} finally {
+			this._releaseRun(settled);
+		}
+		// Decided after the release, which writes the messages queued while settling. One of them
+		// can be the new tail, and a driver told "no work" would leave it unanswered.
+		return this._stoppedTurnHasWork();
+	}
+
+	/**
+	 * End a busy window that is not a run, such as a settle or a recording. When the work
+	 * completed, messages queued while busy go in first, still busy, so a subscriber reacting
+	 * to one queues behind the rest instead of starting a turn between them. When it failed
+	 * they stay queued. Written after a part-settled step, they would hide its open calls from
+	 * the next settle.
+	 */
+	private _releaseRun(completed: boolean): void {
+		try {
+			if (completed) {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
 			}
 		} finally {
-			if (this._agentRunAbortRequested) this._finishCancelledRetry();
-			this._failedResponse = undefined;
-			this._runSystemPromptOptions = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			this._isAgentRunActive = false;
+			this._resolveIdleWaitIfIdle();
 		}
+	}
+
+	/**
+	 * Write down that the turn is over when it ends on a result, which only `terminate` does.
+	 * Returns whether it wrote the marker.
+	 */
+	private _markTurnEndedOnResult(): boolean {
+		const last = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
+		if (last?.role !== "toolResult") return false;
+		// The transcript alone can end on a result for other reasons. A reply that overflowed is
+		// omitted before recovery, and if recovery fails, an earlier step's result is left at
+		// the tail. Only the run's last response asking for this call means its tools ended it.
+		// The loop runs the calls a response holds, whatever its stop reason says, and a finished
+		// run stops on their results only when the tools end it. So the stop reason isn't asked.
+		const final = this._runFinalResponse;
+		const callId = last.toolCallId;
+		const askedFor = final?.content.some((block) => block.type === "toolCall" && block.id === callId);
+		if (!askedFor) return false;
+		const messageEntryId = this._findPersistedMessageEntryId(last);
+		if (!messageEntryId) return false;
+		const entryId = this.sessionManager.appendCustomEntry(TURN_ENDED_ON_RESULT_ENTRY, { messageEntryId });
+		const entry = this.sessionManager.getEntry(entryId);
+		if (entry) this._emit({ type: "entry_appended", entry });
+		return true;
+	}
+
+	/** Whether the file says the turn ended on `message` on purpose. */
+	private _turnEndedOn(message: AgentMessage): boolean {
+		const messageEntryId = this._findPersistedMessageEntryId(message);
+		if (!messageEntryId) return false;
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.id === messageEntryId) return false;
+			if (entry.type !== "custom" || entry.customType !== TURN_ENDED_ON_RESULT_ENTRY) continue;
+			if ((entry.data as { messageEntryId?: string } | undefined)?.messageEntryId === messageEntryId) return true;
+		}
+		return false;
+	}
+
+	/** Give open calls an outcome and drop a trailing assistant message that holds no answer. */
+	private _settleStoppedTurn(): void {
+		const messages = this.agent.state.messages;
+		const dangling = findDanglingToolCalls(messages);
+		if (dangling.length > 0) {
+			const settled = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
+			this._recordMessages(settled);
+			return;
+		}
+
+		const last = messages.findLast((message) => !isOutsideToolPairing(message));
+		// An errored or aborted assistant message holds no answer, and the provider
+		// never sees it. Drop it so the transcript ends where the model can pick up.
+		if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
+			// Memory is rebuilt from the session file, so a written message is omitted there too,
+			// or the next rebuild brings it back.
+			if (this._findPersistedMessageEntryId(last)) {
+				this._omitRecoveryAttempt(last);
+			} else {
+				this.agent.state.messages = messages.filter((message) => message !== last);
+			}
+			this._settleStoppedTurn();
+		}
+	}
+
+	/** Whether the transcript, as it stands, has something the model has not answered. */
+	private _stoppedTurnHasWork(): boolean {
+		const messages = this.agent.state.messages;
+		if (findDanglingToolCalls(messages).length > 0) return true;
+		// The provider pairs results with calls past these, so they do not decide what comes next.
+		const last = messages.findLast((message) => !isOutsideToolPairing(message));
+		if (!last) return false;
+		// A turn whose tools asked it to stop ends on their results, and it is answered.
+		if (last.role === "toolResult" && this._turnEndedOn(last)) return false;
+		// Every other role reaches the provider as a user turn or a result, which a model call
+		// answers. A settled transcript has no unanswered assistant message left at its tail.
+		return last.role !== "assistant";
+	}
+
+	/**
+	 * Put messages in the transcript without running anything. The durable record comes
+	 * first, and memory follows one message at a time: if a write throws, memory must hold
+	 * exactly what the file does, or the next resume writes a message a second time.
+	 *
+	 * No extension sees these, because the `message_end` they get can replace a message and
+	 * this has to stay synchronous for prepareStep(). See _recordMessagesThroughExtensions().
+	 */
+	private _recordMessages(messages: AgentMessage[]): void {
+		for (const message of messages) {
+			this._persistMessage(message);
+			this.agent.state.messages = [...this.agent.state.messages, message];
+			this._emit({ type: "message_start", message });
+			this._emit({ type: "message_end", message });
+		}
+	}
+
+	/**
+	 * Record messages a turn takes in, offering each to the extensions' message events first
+	 * the way the loop does when it adds them. A `message_end` handler can replace the message,
+	 * so what is recorded is what the handlers leave.
+	 */
+	private async _recordMessagesThroughExtensions(messages: AgentMessage[]): Promise<void> {
+		for (const message of messages) {
+			await this._emitExtensionEvent({ type: "message_start", message });
+			await this._emitExtensionEvent({ type: "message_end", message });
+			this._recordMessages([message]);
+		}
+	}
+
+	/** Write one message to the session file, in the entry shape its role belongs in. */
+	private _persistMessage(message: AgentMessage): void {
+		let entryId: string | undefined;
+		if (message.role === "custom") {
+			entryId = this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} else if (
+			message.role === "system" ||
+			message.role === "user" ||
+			message.role === "assistant" ||
+			message.role === "toolResult"
+		) {
+			entryId = this.sessionManager.appendMessage(message);
+		}
+		if (entryId) this._entryIdsByMessage.set(message, entryId);
+		// Other roles (bashExecution, compactionSummary, branchSummary) are persisted elsewhere.
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1855,6 +2066,7 @@ export class AgentSession {
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
 		this._lastAssistantToolResults = [];
+		if (message) this._runFinalResponse = message;
 		if (this._agentRunAbortRequested) {
 			this._finishCancelledRetry();
 			return false;
@@ -1970,6 +2182,91 @@ export class AgentSession {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
+		const messages = await this._buildPromptMessages(text, options);
+		if (!messages) {
+			return;
+		}
+
+		// The builder holds the session for this call, and the turn takes it over from here.
+		try {
+			options?.preflightResult?.("started");
+		} catch (error) {
+			this._releaseRun(false);
+			throw error;
+		}
+		await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Record a prompt without running it. Everything prompt() does to build the turn
+	 * happens here (extension input, template expansion, the model and auth checks); the
+	 * model call does not. Whatever drives the turn next picks it up from the transcript.
+	 *
+	 * For a caller that drives a turn one step at a time and checkpoints in between.
+	 * Returns whether a prompt was recorded: an extension command handles its own text,
+	 * and a prompt sent mid-stream is queued instead. The options' preflightResult tells
+	 * those apart: a queued prompt runs later, model call included, in whatever turn picks
+	 * it up. Throws while a tool call of the last stopped step has no result, because the
+	 * prompt would land between the two; prepareStep() settles them.
+	 *
+	 * Two exceptions to "no model call". Compaction can run here, the way it does before a
+	 * prompt, and compaction asks the model once. And abort() does not reach a recording:
+	 * the session stays busy until the extensions' message handlers return. The recording
+	 * itself is not idempotent either. A retry whose first attempt finished but never
+	 * reported records the text a second time, so a driver that retries carries its own
+	 * mark in the text and checks the transcript tail for it.
+	 */
+	async recordPrompt(text: string, options?: PromptOptions): Promise<boolean> {
+		// Refused before the build takes anything, so a rejected prompt leaves the queued
+		// messages and the prompt options as they were. It runs after commands and queueing,
+		// because a live run's in-flight call is not a dangling one.
+		const refuseUnsettled = () => {
+			if (findDanglingToolCalls(this.agent.state.messages).length > 0) {
+				throw new Error(UNSETTLED_CALLS_MESSAGE);
+			}
+		};
+		const messages = await this._buildPromptMessages(text, options, refuseUnsettled);
+		if (!messages) {
+			return false;
+		}
+
+		// The builder holds the session for this call. It stays busy until the prompt is in,
+		// because recording awaits the extensions' message handlers, and a step that started in
+		// between would answer part of it.
+		let recorded = false;
+		try {
+			options?.preflightResult?.("started");
+			this._beginTurn();
+			// The loop declares a prompt's loadout as it adds the prompt; a recorded one never
+			// reaches it.
+			const { messages: transcript, tools } = this.agent.state;
+			const declared = declareToolChanges({ messages: transcript, tools }, messages);
+			// A recorded prompt starts a user turn like one the loop adds, so it gets the same fresh
+			// recovery allowance. The loop resets it when the user message starts, which recording
+			// never goes through, and an allowance spent by the last turn would fail this one.
+			if (declared.some((message) => message.role === "user")) this._overflowRecoveryAttempted = false;
+			await this._recordMessagesThroughExtensions(declared);
+			recorded = true;
+		} finally {
+			// Queued while busy, these belong before the step that answers the prompt.
+			this._releaseRun(recorded);
+		}
+		return true;
+	}
+
+	/**
+	 * All of prompt() except the running of it. Returns the turn's messages with the session held
+	 * for the caller, or undefined when the text needed no run at all.
+	 *
+	 * `beforeBuild` runs once the text is known to start a new turn, before anything is taken from
+	 * the queues or the prompt options change, so a caller can still refuse without side effects.
+	 * It runs again after the last await, for what changed while the build waited.
+	 */
+	private async _buildPromptMessages(
+		text: string,
+		options?: PromptOptions,
+		beforeBuild?: () => void,
+	): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -1984,9 +2281,7 @@ export class AgentSession {
 		}
 
 		if (this._compactionAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
+			throw new Error(COMPACTING_MESSAGE);
 		}
 
 		// Emit input event for extension interception (before skill/template expansion)
@@ -2025,6 +2320,30 @@ export class AgentSession {
 			return;
 		}
 
+		beforeBuild?.();
+
+		// One build at a time from here. What follows changes shared state (the queues, the tool
+		// loadout, the prompt options), and extension hooks run between those changes. A second
+		// build is refused before it changes anything, so its hooks cannot touch this one's loadout.
+		// Input handlers stay outside on purpose. They also run for a prompt queued during a live
+		// turn, so they are never kept apart from a turn, and one may handle the text itself.
+		if (this._buildingPrompt) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
+		this._buildingPrompt = true;
+		try {
+			return await this._buildNewTurn(expandedText, currentImages, beforeBuild);
+		} finally {
+			this._buildingPrompt = false;
+		}
+	}
+
+	/** The part of the build that starts a new turn. One runs at a time. */
+	private async _buildNewTurn(
+		expandedText: string,
+		currentImages: ImageContent[] | undefined,
+		beforeBuild?: () => void,
+	): Promise<AgentMessage[]> {
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
@@ -2073,6 +2392,37 @@ export class AgentSession {
 		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
 		const normalized = await this._normalizePromptImages(currentImages);
+		// The last await. A run that started during any of them owns the tool loadout and the prompt
+		// options this would now replace.
+		if (this._isAgentRunActive) {
+			throw new Error(BUILD_BUSY_MESSAGE);
+		}
+		// Compaction and a branch summary rewrite the transcript without holding the session as a
+		// run does, and either can have started during the awaits too.
+		if (this.isCompacting) {
+			throw new Error(COMPACTING_MESSAGE);
+		}
+		// A run that stopped during the awaits can have left calls open.
+		beforeBuild?.();
+		// Claimed in the same synchronous block as the check, before the loadout and the options
+		// change. A second builder that resumes before this caller does then finds the session
+		// busy, instead of putting its own loadout under this caller's turn. The caller gets the
+		// session held and releases it.
+		this._isAgentRunActive = true;
+		try {
+			return this._finishPromptMessages(expandedText, normalized, result);
+		} catch (error) {
+			this._releaseRun(false);
+			throw error;
+		}
+	}
+
+	/** The synchronous end of the build, run with the session held. */
+	private _finishPromptMessages(
+		expandedText: string,
+		normalized: { images: ImageContent[]; hints: string[] },
+		result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>,
+	): AgentMessage[] {
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
@@ -2106,8 +2456,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**
@@ -2329,6 +2678,11 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
+		this._writeCustomMessage(appMessage);
+		this._announceCustomMessage(appMessage);
+	}
+
+	private _writeCustomMessage(appMessage: CustomMessage): void {
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
@@ -2336,6 +2690,9 @@ export class AgentSession {
 			appMessage.details,
 		);
 		this._refreshFinalizedContext();
+	}
+
+	private _announceCustomMessage(appMessage: CustomMessage): void {
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
 	}
@@ -2345,12 +2702,23 @@ export class AgentSession {
 	 * Called once the current turn's tool results are in agent state and session history.
 	 */
 	private _flushPendingCustomMessages(): void {
-		if (this._pendingCustomMessages.length === 0) return;
-
-		const pending = this._pendingCustomMessages;
-		this._pendingCustomMessages = [];
-		for (const appMessage of pending) {
-			this._appendCustomMessage(appMessage);
+		// A subscriber can call back in from the announcement, and a second flush would write
+		// the messages this one has not reached yet. They are this flush's to write.
+		if (this._isFlushingCustomMessages) return;
+		this._isFlushingCustomMessages = true;
+		try {
+			// Each message leaves the queue once it is written, and only then do subscribers hear of
+			// it. So a write that fails keeps it and the rest for the next flush, and a subscriber
+			// that throws can't leave a written message queued to go in twice. What a subscriber
+			// queues while this runs waits for the next flush.
+			for (let count = this._pendingCustomMessages.length; count > 0; count--) {
+				const appMessage = this._pendingCustomMessages[0];
+				this._writeCustomMessage(appMessage);
+				this._pendingCustomMessages.shift();
+				this._announceCustomMessage(appMessage);
+			}
+		} finally {
+			this._isFlushingCustomMessages = false;
 		}
 	}
 
@@ -3925,11 +4293,15 @@ export class AgentSession {
 	private _flushPendingBashMessages(): void {
 		if (this._pendingBashMessages.length === 0) return;
 
-		for (const bashMessage of this._pendingBashMessages) {
-			this.sessionManager.appendMessage(bashMessage);
+		// The same rule as for custom messages. Only what was written leaves the queue.
+		try {
+			while (this._pendingBashMessages.length > 0) {
+				this.sessionManager.appendMessage(this._pendingBashMessages[0]);
+				this._pendingBashMessages.shift();
+			}
+		} finally {
+			this._refreshFinalizedContext();
 		}
-		this._pendingBashMessages = [];
-		this._refreshFinalizedContext();
 	}
 
 	// =========================================================================

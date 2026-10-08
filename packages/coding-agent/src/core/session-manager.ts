@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolCall } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	getCurrentSystemMessage,
@@ -21,6 +21,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	rmSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -593,6 +594,58 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 	return join(resolvedAgentDir, "sessions", safePath);
 }
 
+/**
+ * Find the unsettled tool calls of an interrupted turn. `Agent.continue()` refuses a
+ * trailing assistant message, so a turn that stopped between a tool call and its result
+ * can't be finished until each call is settled. Settling them in the transcript also
+ * keeps the record readable on its own, instead of each request having to synthesize
+ * the missing results again.
+ *
+ * Only the last assistant message counts, and only when what follows it is its own results
+ * or messages that stay out of the pairing (see {@link isOutsideToolPairing}). An aborted
+ * tool batch leaves older calls unresolved on purpose, and a result appended at the tail
+ * for one of those attaches to the wrong call. Anything else after the message reaches the
+ * provider as a user turn, which closes the calls before it, so a result appended after it
+ * pairs with nothing. Errored and aborted messages are skipped because the provider never
+ * sees them, so a result for their calls has nothing to pair with either.
+ */
+export function findDanglingToolCalls(messages: readonly AgentMessage[]): AgentToolCall[] {
+	const answered = new Set<string>();
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role === "toolResult") {
+			answered.add(message.toolCallId);
+			continue;
+		}
+		if (isOutsideToolPairing(message)) {
+			continue;
+		}
+		if (message.role !== "assistant") {
+			return [];
+		}
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			return [];
+		}
+		return message.content.filter(
+			(block): block is AgentToolCall => block.type === "toolCall" && !answered.has(block.id),
+		);
+	}
+	return [];
+}
+
+/**
+ * Whether a message stays out of the pairing of tool calls with their results. The provider
+ * transform holds a system message back until the calls before it are answered, and a bash
+ * execution excluded from context never reaches the provider. Every other role takes part in
+ * the pairing or reaches the provider as a user turn.
+ */
+export function isOutsideToolPairing(message: AgentMessage): boolean {
+	if (message.role === "bashExecution") {
+		return message.excludeFromContext === true;
+	}
+	return message.role === "system";
+}
+
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const sessionDir = getDefaultSessionDirPath(cwd, agentDir);
 	if (!existsSync(sessionDir)) {
@@ -997,6 +1050,8 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private _writeGuard?: () => void;
+	// A failed append may have left part of a line at the end of the file.
+	private _cutTail = false;
 
 	private constructor(
 		cwd: string,
@@ -1177,24 +1232,65 @@ export class SessionManager {
 			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				try {
+					for (const e of this.fileEntries) {
+						writeFileSync(fd, `${JSON.stringify(e)}\n`);
+					}
+				} finally {
+					closeSync(fd);
 				}
-			} finally {
-				closeSync(fd);
+			} catch (error) {
+				// This call created the file, so a part of it is ours to remove. Left in place, it
+				// makes every retry fail to create the file, and the session can never be written.
+				// Only while this process may still write. Once the guard refuses, another writer
+				// can own the file and have written to it, and removing it would lose that.
+				if (this._mayStillWrite()) rmSync(this.sessionFile, { force: true });
+				throw error;
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			// An append that fails can leave part of its line. The next append ends that part with
+			// a newline first, so the loader skips it as one bad line and reads the retry's line
+			// whole. Never cut the file back. A writer the guard let through can still be in this
+			// write when a newer one appends, and a cut would erase what the newer one wrote.
+			const prefix = this._cutTail ? "\n" : "";
+			try {
+				appendFileSync(this.sessionFile, `${prefix}${JSON.stringify(entry)}\n`);
+			} catch (error) {
+				this._cutTail = true;
+				throw error;
+			}
+			this._cutTail = false;
+		}
+	}
+
+	/** Whether the write guard still lets this process write. */
+	private _mayStillWrite(): boolean {
+		try {
+			this._writeGuard?.();
+			return true;
+		} catch {
+			return false;
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
 		this._writeGuard?.();
+		// _persist of a first write reads fileEntries, so the entry goes in before it. A failed
+		// write then has to take the entry back out, or memory holds an entry the file does not,
+		// and a caller's retry parents new entries to it or appends it a second time.
+		const leafBefore = this.leafId;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			this.leafId = leafBefore;
+			throw error;
+		}
 	}
 
 	/**

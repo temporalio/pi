@@ -150,6 +150,31 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
+// What the transcript says about a call when nothing can say whether it ran. The tool can have had
+// its effect before the run stopped, so calling it a failure would invite a second run of something
+// that already happened. The transcript only shows the model asked for the call, not that it ran,
+// so the text claims neither.
+const UNKNOWN_TOOL_CALL_OUTCOME =
+	"The outcome of this tool call is unknown. The session stopped before its result was " +
+	"recorded, so it is not known whether the call ran. It can have taken effect. Check the " +
+	"current state before you try again.";
+
+/** Settle a call nothing can answer for, so the step it belongs to still closes. */
+export function unknownToolCallOutcome(toolCall: { id: string; name: string }): TurnToolCallOutcome {
+	return {
+		message: {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: UNKNOWN_TOOL_CALL_OUTCOME }],
+			details: {},
+			isError: true,
+			timestamp: Date.now(),
+		},
+		terminate: false,
+	};
+}
+
 function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	return new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
@@ -217,7 +242,7 @@ interface TurnToolCallParams {
 	emit: AgentEventSink;
 }
 
-interface TurnToolCallOutcome {
+export interface TurnToolCallOutcome {
 	message: ToolResultMessage;
 	/** The tool asked for the run to stop. A batch ends the turn only when every call does. */
 	terminate: boolean;
@@ -531,7 +556,7 @@ async function runLoop(
  * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
  * system message is inserted before the first non-system pending message.
  */
-function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
+export function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
 	let systemIndex = -1;
 	for (let i = pendingMessages.length - 1; i >= 0; i--) {
 		if (pendingMessages[i].role === "system") {
