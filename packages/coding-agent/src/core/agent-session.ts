@@ -412,6 +412,7 @@ export class AgentSession {
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
+	private _isFlushingCustomMessages = false;
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -2661,6 +2662,11 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
+		this._writeCustomMessage(appMessage);
+		this._announceCustomMessage(appMessage);
+	}
+
+	private _writeCustomMessage(appMessage: CustomMessage): void {
 		this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
@@ -2668,6 +2674,9 @@ export class AgentSession {
 			appMessage.details,
 		);
 		this._refreshFinalizedContext();
+	}
+
+	private _announceCustomMessage(appMessage: CustomMessage): void {
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
 	}
@@ -2677,12 +2686,23 @@ export class AgentSession {
 	 * Called once the current turn's tool results are in agent state and session history.
 	 */
 	private _flushPendingCustomMessages(): void {
-		// Each message leaves the queue once it is written, so a write that fails keeps it and the
-		// rest for the next flush, and nothing goes in twice. What a subscriber queues while this
-		// runs waits for the next flush.
-		for (let count = this._pendingCustomMessages.length; count > 0; count--) {
-			this._appendCustomMessage(this._pendingCustomMessages[0]);
-			this._pendingCustomMessages.shift();
+		// A subscriber can call back in from the announcement, and a second flush would write
+		// the messages this one has not reached yet. They are this flush's to write.
+		if (this._isFlushingCustomMessages) return;
+		this._isFlushingCustomMessages = true;
+		try {
+			// Each message leaves the queue once it is written, and only then do subscribers hear of
+			// it. So a write that fails keeps it and the rest for the next flush, and a subscriber
+			// that throws can't leave a written message queued to go in twice. What a subscriber
+			// queues while this runs waits for the next flush.
+			for (let count = this._pendingCustomMessages.length; count > 0; count--) {
+				const appMessage = this._pendingCustomMessages[0];
+				this._writeCustomMessage(appMessage);
+				this._pendingCustomMessages.shift();
+				this._announceCustomMessage(appMessage);
+			}
+		} finally {
+			this._isFlushingCustomMessages = false;
 		}
 	}
 

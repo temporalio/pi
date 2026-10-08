@@ -676,6 +676,57 @@ describe("AgentSession: settling an interrupted turn", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 	});
 
+	it("writes a queued message once when a subscriber throws on hearing of it", async () => {
+		await createSession();
+		seed([user("go"), answer("done")]);
+		const internals = session as unknown as {
+			_pendingCustomMessages: CustomMessage[];
+			_flushPendingCustomMessages(): void;
+		};
+		internals._pendingCustomMessages = [
+			{ ...note("a"), display: false },
+			{ ...note("b"), display: false },
+		];
+		let thrown = false;
+		session.subscribe((event) => {
+			if (event.type === "message_end" && !thrown) {
+				thrown = true;
+				throw new Error("subscriber broke");
+			}
+		});
+
+		expect(() => internals._flushPendingCustomMessages()).toThrow("subscriber broke");
+		internals._flushPendingCustomMessages();
+
+		const notes = sessionManager
+			.getBranch()
+			.flatMap((e) => (e.type === "custom_message" ? [contentText(e.content as never, "")] : []));
+		expect(notes).toEqual(["a", "b"]);
+	});
+
+	it("writes a queued message once when a subscriber flushes again mid-flush", async () => {
+		await createSession();
+		seed([user("go"), answer("done")]);
+		const internals = session as unknown as {
+			_pendingCustomMessages: CustomMessage[];
+			_flushPendingCustomMessages(): void;
+		};
+		internals._pendingCustomMessages = [
+			{ ...note("a"), display: false },
+			{ ...note("b"), display: false },
+		];
+		session.subscribe((event) => {
+			if (event.type === "message_end") internals._flushPendingCustomMessages();
+		});
+
+		internals._flushPendingCustomMessages();
+
+		const notes = sessionManager
+			.getBranch()
+			.flatMap((e) => (e.type === "custom_message" ? [contentText(e.content as never, "")] : []));
+		expect(notes).toEqual(["a", "b"]);
+	});
+
 	it("reads a turn its tools stopped as answered, also after a reopen", async () => {
 		const stop = {
 			name: "do",
