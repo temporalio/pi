@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import { type AssistantMessage, createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -19,19 +19,6 @@ const testGlobals = globalThis as typeof globalThis & {
 	turnsSeen?: unknown;
 	releaseTurn?: () => void;
 };
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 const usage = {
 	input: 0,
@@ -107,7 +94,7 @@ describe("turn executor", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
 			streamFn: () => {
-				const stream = new MockAssistantStream();
+				const stream = createAssistantMessageEventStream();
 				modelCalls++;
 				queueMicrotask(() => {
 					stream.push({ type: "done", reason: "stop", message: assistant("answer") });

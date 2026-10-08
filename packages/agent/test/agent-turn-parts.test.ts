@@ -5,8 +5,7 @@
 // loop runs itself have to leave the same transcript, or the two drivers have drifted.
 import {
 	type AssistantMessage,
-	type AssistantMessageEvent,
-	EventStream,
+	createAssistantMessageEventStream,
 	type Message,
 	type Model,
 	type UserMessage,
@@ -21,19 +20,6 @@ import {
 	type TurnToolCallOutcome,
 } from "../src/agent-loop.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 function createUsage() {
 	return {
@@ -122,7 +108,7 @@ function toolCall(id: string, name = "probe", value = id) {
 function scriptedModel(responses: Array<() => AssistantMessage>) {
 	const asked = { count: 0 };
 	const streamFn = () => {
-		const stream = new MockAssistantStream();
+		const stream = createAssistantMessageEventStream();
 		queueMicrotask(() => {
 			const next = responses[Math.min(asked.count, responses.length - 1)];
 			asked.count++;

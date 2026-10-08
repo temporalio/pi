@@ -7,7 +7,7 @@
 // response neither prepares nor asks the provider again, and a retried model call reuses the
 // preparation rather than running it a second time.
 
-import { type AssistantMessage, type AssistantMessageEvent, EventStream } from "@earendil-works/pi-ai";
+import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
@@ -24,19 +24,6 @@ const echoTool = {
 	parameters: echoSchema,
 	execute: async (args: { value: string }) => ({ output: args.value }),
 } as unknown as AgentTool;
-
-class Response extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("not a final response");
-			},
-		);
-	}
-}
 
 /** Which context a phase ran against. Preparation marks the one it returns. */
 type Labelled = AgentContext & { label?: string };
@@ -78,7 +65,7 @@ function agentUnderTest(options: { prepareOnce?: boolean } = {}) {
 			calls++;
 			recorded.prompts.push(promptOf(model));
 			recorded.models.push(model as unknown as string);
-			const stream = new Response();
+			const stream = createAssistantMessageEventStream();
 			// The first two responses ask for a tool, so the step after preparation has a tool phase
 			// and a seal to observe. The third ends the turn.
 			const first = recorded.prompts.length <= 2;

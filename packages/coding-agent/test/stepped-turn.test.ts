@@ -9,9 +9,8 @@ import { Agent, type AgentMessage, type AgentTool, type TurnToolCallOutcome } fr
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
-	type AssistantMessageEvent,
 	type Context,
-	EventStream,
+	createAssistantMessageEventStream,
 	getModel,
 } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -33,19 +32,6 @@ const testGlobals = globalThis as typeof globalThis & {
 	steppedContinued?: boolean;
 	steppedTurnEnds?: number;
 };
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 const usage = {
 	input: 0,
@@ -155,7 +141,7 @@ describe("stepped turn", () => {
 			initialState: { model, systemPrompt: "Test", tools: [] },
 			streamFn: (_model, context, streamOptions) => {
 				requests.push(context);
-				const stream = new MockAssistantStream();
+				const stream = createAssistantMessageEventStream();
 				if (options.hangModel && requests.length === 1) {
 					const aborted = assistant([], "aborted");
 					stream.push({ type: "start", partial: aborted });
