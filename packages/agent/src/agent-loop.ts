@@ -203,10 +203,12 @@ export interface StepCursor {
 	previousTurn?: PrepareNextTurnContext;
 	prepared?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
 	/**
-	 * The model and thinking level the last preparation chose. The loop keeps them for the rest of
-	 * the run when a later preparation returns nothing, so the next step starts from them too.
+	 * The context and config the last model call ran under, after both preparation callbacks.
+	 * The loop keeps them for the rest of the run when a later preparation returns nothing, so
+	 * the next step starts from them too. Its messages are not kept: the agent's transcript is
+	 * where the step's results went.
 	 */
-	runtime?: Pick<AgentLoopConfig, "model" | "reasoning">;
+	runtime?: { readonly context: AgentContext; readonly config: AgentLoopConfig };
 }
 
 export interface AgentModelCallOutcome {
@@ -275,10 +277,10 @@ export async function runAgentModelCall(
 	// this is another one. Preparing again would run the app's callback twice for one step, and
 	// compaction is the kind of thing that callback does.
 	const retry = cursor?.prepared;
-	const runConfig = cursor?.runtime ? { ...config, ...cursor.runtime } : config;
+	const kept = cursor?.runtime;
 	const outcome = await runTurnModelCall({
-		context: retry ? { ...retry.context } : { ...context },
-		config: retry ? retry.config : runConfig,
+		context: retry ? { ...retry.context } : kept ? { ...kept.context, messages: context.messages } : { ...context },
+		config: retry ? retry.config : (kept?.config ?? config),
 		newMessages: [],
 		pendingMessages: [],
 		previousTurn: retry ? undefined : cursor?.previousTurn,
@@ -287,7 +289,6 @@ export async function runAgentModelCall(
 					// Recorded here rather than after the call returns, so an attempt that dies in
 					// the provider does not leave the next one preparing the same step again.
 					cursor.prepared = state;
-					cursor.runtime = { model: state.config.model, reasoning: state.config.reasoning };
 					cursor.previousTurn = undefined;
 				}
 			: undefined,
@@ -297,7 +298,10 @@ export async function runAgentModelCall(
 		streamFunction: streamFn ?? getDefaultStreamFn(),
 	});
 
-	if (cursor) cursor.prepared = { context: outcome.context, config: outcome.config };
+	if (cursor) {
+		cursor.prepared = { context: outcome.context, config: outcome.config };
+		cursor.runtime = cursor.prepared;
+	}
 	return {
 		toolCalls: outcome.toolCalls,
 		sequential: mustRunToolCallsInOrder(outcome.context, outcome.config, outcome.message, outcome.toolCalls),

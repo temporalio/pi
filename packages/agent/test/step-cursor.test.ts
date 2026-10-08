@@ -204,6 +204,75 @@ describe("the step cursor", () => {
 		expect(recorded.models.slice(1)).toEqual([PREPARED_MODEL, PREPARED_MODEL]);
 	});
 
+	// The loop carries what `prepareRequest` returned into every later request of the run. Stepped
+	// from outside, the turn has to do the same, for the model and thinking level and for the
+	// replaced context the tools run against.
+	it("keeps what prepareRequest returned once for the rest of the turn, as the loop does", async () => {
+		const run = async (stepped: boolean) => {
+			const requests: string[] = [];
+			const ran: string[] = [];
+			let responses = 0;
+			const tool = (impl: string) =>
+				({
+					...echoTool,
+					execute: async () => {
+						ran.push(impl);
+						return { content: [{ type: "text", text: impl }], details: {} };
+					},
+				}) as AgentTool;
+			const agent = new Agent({
+				initialState: { tools: [tool("original")] },
+				prepareRequest: ({ context, model }) => {
+					if (requests.length > 0) return undefined;
+					return {
+						model: { ...model, id: "routed" },
+						thinkingLevel: "high",
+						context: { ...context, tools: [tool("replaced")] },
+					};
+				},
+				streamFn: (model, _context, options) => {
+					requests.push(`${(model as { id?: string }).id ?? "original"}/${options?.reasoning ?? "off"}`);
+					responses++;
+					const more = responses <= 2;
+					const stream = createAssistantMessageEventStream();
+					const message: AssistantMessage = {
+						role: "assistant",
+						content: more
+							? [{ type: "toolCall", id: `call-${responses}`, name: "echo", arguments: { value: "x" } }]
+							: [{ type: "text", text: "done" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "mock",
+						timestamp: Date.now(),
+						stopReason: more ? "toolUse" : "stop",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+					};
+					queueMicrotask(() => stream.push({ type: "done", reason: more ? "toolUse" : "stop", message }));
+					return stream;
+				},
+			});
+			if (stepped) {
+				agent.state.messages = [{ role: "user", content: "run", timestamp: Date.now() }];
+				for (let step = 0; step < 3; step++) await driveStep(agent);
+			} else {
+				await agent.prompt("run");
+			}
+			return { requests, ran };
+		};
+
+		const ordinary = await run(false);
+		expect(ordinary.requests).toEqual(["routed/high", "routed/high", "routed/high"]);
+		expect(ordinary.ran).toEqual(["replaced", "replaced"]);
+		expect(await run(true)).toEqual(ordinary);
+	});
+
 	it("forgets what the last run's steps left behind on reset() and startTurn()", async () => {
 		for (const fresh of [(agent: Agent) => agent.reset(), (agent: Agent) => agent.startTurn()]) {
 			const { agent, recorded } = agentUnderTest();
