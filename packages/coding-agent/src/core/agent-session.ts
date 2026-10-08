@@ -409,6 +409,15 @@ function promptOptionChanges(
 const TURN_END_DISPATCHED_ENTRY = "pi.turn-end-dispatched";
 // Names the last message entry of a stepped turn whose `agent_before_settle` boundary ran.
 const SETTLE_DISPATCHED_ENTRY = "pi.before-settle-dispatched";
+// Names a response a recovery took out of the context without scheduling another request, and
+// the counts its seal returned.
+const RECOVERY_DECLINED_ENTRY = "pi.recovery-declined";
+
+interface RecoveryDeclined {
+	messageEntryId: string;
+	retryAttempt: number;
+	overflowRecoveryAttempted: boolean;
+}
 
 interface TurnEndDispatch {
 	messageEntryId: string;
@@ -2495,6 +2504,17 @@ export class AgentSession {
 			options.postRun === false
 				? false
 				: await this._postSealPass(options.retryAttempt, options.overflowRecoveryAttempted);
+		// The omission alone reads as a scheduled request on replay. A compaction that failed, was
+		// cancelled or found nothing to compact, and a cancelled retry, scheduled none.
+		const omitted = needsAnotherPass ? undefined : this._findOmittedStepResponse();
+		if (omitted?.recovery) {
+			const declined: RecoveryDeclined = {
+				messageEntryId: omitted.entryId,
+				retryAttempt: this._retryAttempt,
+				overflowRecoveryAttempted: this._overflowRecoveryAttempted,
+			};
+			this._appendInternalEntry(RECOVERY_DECLINED_ENTRY, declined);
+		}
 		let done = !outcome.hasMoreToolCalls && !needsAnotherPass;
 		if (done) done = await this._settleSteppedTurn(options.postRun !== false);
 		if (!done) await this._admitQueuedMessages();
@@ -2526,6 +2546,14 @@ export class AgentSession {
 				overflowRecoveryAttempted: options.overflowRecoveryAttempted ?? false,
 			};
 		}
+		if (found.declined) {
+			// The recovery scheduled nothing, so the seal decided the way a turn_end-only seal does.
+			return {
+				done: !found.dispatch?.continue,
+				retryAttempt: found.declined.retryAttempt,
+				overflowRecoveryAttempted: found.declined.overflowRecoveryAttempted,
+			};
+		}
 		const omitted = found.message;
 		const retried = this._isRetryableError(omitted);
 		return {
@@ -2545,15 +2573,27 @@ export class AgentSession {
 	 * edit goes in before it, in the same write. So the order in the file says which one it was.
 	 */
 	private _findOmittedStepResponse():
-		| { message: AssistantMessage; entryId: string; recovery: boolean; dispatch?: TurnEndDispatch }
+		| {
+				message: AssistantMessage;
+				entryId: string;
+				recovery: boolean;
+				dispatch?: TurnEndDispatch;
+				declined?: RecoveryDeclined;
+		  }
 		| undefined {
 		const omitted = new Set<string>();
 		const byRecovery = new Set<string>();
 		const dispatches = new Map<string, TurnEndDispatch>();
+		const declines = new Map<string, RecoveryDeclined>();
 		let pastDispatch = false;
 		const branch = this.sessionManager.getBranch();
 		for (let index = branch.length - 1; index >= 0; index--) {
 			const entry = branch[index];
+			if (entry.type === "custom" && entry.customType === RECOVERY_DECLINED_ENTRY) {
+				const declined = entry.data as RecoveryDeclined | undefined;
+				if (declined) declines.set(declined.messageEntryId, declined);
+				continue;
+			}
 			if (entry.type === "custom" && entry.customType === TURN_END_DISPATCHED_ENTRY) {
 				const dispatch = entry.data as TurnEndDispatch | undefined;
 				if (dispatch) dispatches.set(dispatch.messageEntryId, dispatch);
@@ -2573,6 +2613,7 @@ export class AgentSession {
 					entryId: entry.id,
 					recovery: byRecovery.has(entry.id),
 					dispatch: dispatches.get(entry.id),
+					declined: declines.get(entry.id),
 				};
 			}
 		}

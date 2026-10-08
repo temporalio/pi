@@ -882,6 +882,20 @@ describe("stepped turn", () => {
 		await expect(again.session.sealStep([], { retryAttempt: 0, stepId: "older" })).rejects.toThrow("is over");
 	});
 
+	it("replays a recovery that could not compact as the end of the turn", async () => {
+		// A cut-off first answer: recovery takes it out, but there is no history to compact.
+		const cut = { ...assistant([{ type: "text", text: "partial" }], "length"), model: "claude-sonnet-4-5" };
+		const responses = [cut, assistant([{ type: "text", text: "never" }])];
+		const first = await createSession("recovery-declined", { responses });
+		await first.session.recordPrompt("go");
+		const { stepId } = await first.session.modelCall();
+		const decided = await first.session.sealStep([], { stepId });
+		expect(decided).toEqual({ done: true, retryAttempt: 0, overflowRecoveryAttempted: true });
+
+		const again = await reopen(first, "recovery-declined-again", { responses });
+		expect(await again.session.sealStep([], { stepId })).toEqual(decided);
+	});
+
 	it("is busy while a reopened session runs a tool call", async () => {
 		const first = await createSession("busy-tool");
 		await first.session.recordPrompt("go");
