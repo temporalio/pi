@@ -1989,6 +1989,8 @@ export class AgentSession {
 	private async _drive(initial: () => Promise<void>, record: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		let finished = false;
+		// An executor can return with the turn still open, its prompt unanswered.
+		let completed = false;
 		const run = async () => {
 			// An executor can hold the turn and call this after the user stopped it. The agent has
 			// no run to abort until this starts one, and starting one clears its stop.
@@ -2018,6 +2020,9 @@ export class AgentSession {
 				if (this.agent.peekQueuedMessages().length <= queued) break;
 				await this.agent.continue();
 			}
+			// The loop leaves through a stop or because the turn is over, and only the second one
+			// completes it.
+			if (!this._agentRunAbortRequested) completed = true;
 		};
 		// Already inside a run, so these go to the agent rather than through the session's own
 		// entry points, which would refuse a run that is under way.
@@ -2033,7 +2038,11 @@ export class AgentSession {
 				return this._runToolCallUntil(toolCallId, options?.signal);
 			},
 			// The run window is `_drive`'s, so the seal here decides and does not settle the run.
-			sealStep: (results, options) => this._sealStep(results, options),
+			sealStep: async (results, options) => {
+				const sealed = await this._sealStep(results, options);
+				if (sealed.done) completed = true;
+				return sealed;
+			},
 		};
 		// Inside the guarded part, because the session can already be held for this turn. A start
 		// that fails has to give it back, or the session stays busy for good.
@@ -2051,7 +2060,7 @@ export class AgentSession {
 			} else {
 				await registered.executor({ sessionId: this.sessionManager.getSessionId(), run, steps });
 			}
-			finished = !this._agentRunAbortRequested;
+			finished = completed && !this._agentRunAbortRequested;
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._failedResponse = undefined;

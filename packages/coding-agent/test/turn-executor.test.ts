@@ -272,6 +272,25 @@ describe("turn executor", () => {
 		expect(Object.keys(recorded.at(-1) ?? {})).not.toHaveLength(0);
 	});
 
+	it("keeps the turn's prompt options when an executor returns before the turn is done", async () => {
+		await createSession(
+			`export default p => {
+				p.on("before_agent_start", () => ({ systemPrompt: "Exact prompt." }));
+				p.registerTurnExecutor(async turn => { await turn.steps.record(); });
+			}`,
+		);
+		await session!.prompt("go");
+
+		// The prompt is in the transcript and unanswered, so the next step still needs the options.
+		const roles = session!.agent.state.messages.filter((m) => m.role !== "system").map((m) => m.role);
+		expect(roles).toEqual(["user"]);
+		const recorded = session!.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === "pi.turn-prompt-options")
+			.map((entry) => (entry.type === "custom" ? (entry.data as { changes: object }).changes : {}));
+		expect(Object.keys(recorded.at(-1) ?? {})).not.toHaveLength(0);
+	});
+
 	it("does not run a turn the user stopped while the executor held it", async () => {
 		await createSession(
 			`export default p => p.registerTurnExecutor(async turn => {
