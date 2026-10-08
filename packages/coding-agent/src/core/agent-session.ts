@@ -441,6 +441,9 @@ export class AgentSession {
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastAssistantToolResults: AgentMessage[] = [];
+	// The last response this run handled after its loop ended. Only a response that asked for
+	// tools can end the turn on their results, so this tells a terminate from an omitted reply.
+	private _runFinalResponse: AssistantMessage | undefined;
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
@@ -1848,6 +1851,7 @@ export class AgentSession {
 	/** What a turn starts with, before anything of it reaches the transcript. */
 	private _beginTurn(): void {
 		this._agentRunAbortRequested = false;
+		this._runFinalResponse = undefined;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
@@ -1887,12 +1891,14 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		let settled = false;
 		try {
-			const hasWork = this._settleStoppedTurn();
+			this._settleStoppedTurn();
 			settled = true;
-			return hasWork;
 		} finally {
 			this._releaseRun(settled);
 		}
+		// Decided after the release, which writes the messages queued while settling. One of them
+		// can be the new tail, and a driver told "no work" would leave it unanswered.
+		return this._stoppedTurnHasWork();
 	}
 
 	/**
@@ -1918,6 +1924,14 @@ export class AgentSession {
 	private _markTurnEndedOnResult(): void {
 		const last = this.agent.state.messages.findLast((message) => !isOutsideToolPairing(message));
 		if (last?.role !== "toolResult") return;
+		// The transcript alone can end on a result for other reasons. A reply that overflowed is
+		// omitted before recovery, and if recovery fails, an earlier step's result is left at
+		// the tail. Only the run's last response asking for this call means its tools ended it.
+		const final = this._runFinalResponse;
+		const askedFor =
+			final?.stopReason === "toolUse" &&
+			final.content.some((block) => block.type === "toolCall" && block.id === last.toolCallId);
+		if (!askedFor) return;
 		const messageEntryId = this._findPersistedMessageEntryId(last);
 		if (!messageEntryId) return;
 		const entryId = this.sessionManager.appendCustomEntry(TURN_ENDED_ON_RESULT_ENTRY, { messageEntryId });
@@ -1939,33 +1953,20 @@ export class AgentSession {
 		return false;
 	}
 
-	private _settleStoppedTurn(): boolean {
+	/** Give open calls an outcome and drop a trailing assistant message that holds no answer. */
+	private _settleStoppedTurn(): void {
 		const messages = this.agent.state.messages;
 		const dangling = findDanglingToolCalls(messages);
 		if (dangling.length > 0) {
 			const settled = dangling.map((toolCall) => unknownToolCallOutcome(toolCall).message);
 			this._recordMessages(settled);
-			return true;
+			return;
 		}
 
-		// The provider pairs results with calls past these, so they do not decide what comes next.
 		const last = messages.findLast((message) => !isOutsideToolPairing(message));
-		if (!last) {
-			return false;
-		}
-		// A turn whose tools asked it to stop ends on their results, and it is answered.
-		if (last.role === "toolResult" && this._turnEndedOn(last)) {
-			return false;
-		}
-		// Every other role reaches the provider as a user turn or a result, which a model call
-		// answers.
-		if (last.role !== "assistant") {
-			return true;
-		}
-
 		// An errored or aborted assistant message holds no answer, and the provider
 		// never sees it. Drop it so the transcript ends where the model can pick up.
-		if (last.stopReason === "error" || last.stopReason === "aborted") {
+		if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) {
 			// Memory is rebuilt from the session file, so a written message is omitted there too,
 			// or the next rebuild brings it back.
 			if (this._findPersistedMessageEntryId(last)) {
@@ -1973,10 +1974,22 @@ export class AgentSession {
 			} else {
 				this.agent.state.messages = messages.filter((message) => message !== last);
 			}
-			return this._settleStoppedTurn();
+			this._settleStoppedTurn();
 		}
+	}
 
-		return false;
+	/** Whether the transcript, as it stands, has something the model has not answered. */
+	private _stoppedTurnHasWork(): boolean {
+		const messages = this.agent.state.messages;
+		if (findDanglingToolCalls(messages).length > 0) return true;
+		// The provider pairs results with calls past these, so they do not decide what comes next.
+		const last = messages.findLast((message) => !isOutsideToolPairing(message));
+		if (!last) return false;
+		// A turn whose tools asked it to stop ends on their results, and it is answered.
+		if (last.role === "toolResult" && this._turnEndedOn(last)) return false;
+		// Every other role reaches the provider as a user turn or a result, which a model call
+		// answers. A settled transcript has no unanswered assistant message left at its tail.
+		return last.role !== "assistant";
 	}
 
 	/**
@@ -2036,6 +2049,7 @@ export class AgentSession {
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
 		this._lastAssistantToolResults = [];
+		if (message) this._runFinalResponse = message;
 		if (this._agentRunAbortRequested) {
 			this._finishCancelledRetry();
 			return false;
@@ -2210,6 +2224,10 @@ export class AgentSession {
 			// reaches it.
 			const { messages: transcript, tools } = this.agent.state;
 			const declared = declareToolChanges({ messages: transcript, tools }, messages);
+			// A recorded prompt starts a user turn like one the loop adds, so it gets the same fresh
+			// recovery allowance. The loop resets it when the user message starts, which recording
+			// never goes through, and an allowance spent by the last turn would fail this one.
+			if (declared.some((message) => message.role === "user")) this._overflowRecoveryAttempted = false;
 			await this._recordMessagesThroughExtensions(declared);
 			recorded = true;
 		} finally {

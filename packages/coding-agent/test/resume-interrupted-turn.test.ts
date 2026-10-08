@@ -9,11 +9,13 @@ import {
 	contentText,
 	EventStream,
 	fauxAssistantMessage,
+	fauxToolCall,
 	getCurrentSystemPrompt,
 	getModel,
 	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai/compat";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -788,6 +790,85 @@ describe("AgentSession: recording a prompt", () => {
 
 			const roles = harness.session.agent.state.messages.map((message) => message.role);
 			expect(roles.slice(-2)).toEqual(["user", "custom"]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+});
+
+describe("AgentSession: what a turn's end records", () => {
+	const doTool: AgentTool = {
+		name: "do",
+		label: "Do",
+		description: "Does a thing and lets the turn go on",
+		parameters: Type.Object({}),
+		execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+	};
+	const overflow = () =>
+		fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
+		});
+
+	it("does not read an overflow it could not recover from as a turn its tools stopped", async () => {
+		// Recovery that never runs leaves the earlier step's result at the tail.
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("session_before_compact", async () => ({ cancel: true }));
+		};
+		const harness = await createHarness({ tools: [doTool], extensionFactories: [extension] });
+		try {
+			harness.setResponses([fauxAssistantMessage([fauxToolCall("do", {})], { stopReason: "toolUse" }), overflow()]);
+
+			await harness.session.prompt("go");
+
+			const tail = harness.session.agent.state.messages.findLast((message) => message.role !== "custom");
+			expect(tail?.role).toBe("toolResult");
+			expect(harness.session.prepareStep()).toBe(true);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("decides whether there is work after it writes what a failed recording queued", async () => {
+		let recording = false;
+		const extension: ExtensionFactory = (pi) => {
+			pi.on("message_start", (event) => {
+				if (!recording || event.message.role !== "user") return;
+				pi.sendMessage({ customType: "note", content: "noted", display: true }, { triggerTurn: false });
+			});
+		};
+		const harness = await createHarness({ extensionFactories: [extension] });
+		try {
+			harness.setResponses([fauxAssistantMessage("first answer")]);
+			await harness.session.prompt("first");
+
+			// The note is queued while the prompt is recorded, then the prompt's write fails.
+			recording = true;
+			const append = vi.spyOn(harness.sessionManager, "appendMessage").mockImplementationOnce(() => {
+				throw new Error("disk full");
+			});
+			await expect(harness.session.recordPrompt("checkpoint")).rejects.toThrow("disk full");
+			append.mockRestore();
+			recording = false;
+
+			// The note goes in when this settle releases the session, and nothing has answered it.
+			expect(harness.session.prepareStep()).toBe(true);
+			expect(harness.session.agent.state.messages.at(-1)?.role).toBe("custom");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("gives a recorded prompt a fresh overflow recovery allowance", async () => {
+		const harness = await createHarness();
+		try {
+			const internals = harness.session as unknown as { _overflowRecoveryAttempted: boolean };
+			// The last turn spent it.
+			internals._overflowRecoveryAttempted = true;
+
+			expect(await harness.session.recordPrompt("a new turn")).toBe(true);
+
+			expect(internals._overflowRecoveryAttempted).toBe(false);
 		} finally {
 			harness.cleanup();
 		}
