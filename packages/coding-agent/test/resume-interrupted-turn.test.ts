@@ -79,6 +79,20 @@ const isUnknownOutcome = (message: AgentMessage | undefined) =>
 	message?.role === "toolResult" &&
 	message.isError &&
 	contentText(message.content, "").startsWith("The outcome of this tool call is unknown.");
+/** A tool whose result ends the turn. */
+const stopTool = () =>
+	({
+		name: "do",
+		label: "Do",
+		description: "Asks the turn to stop",
+		parameters: { type: "object", properties: {} },
+		execute: async () => ({
+			content: [{ type: "text", text: "stopped" }],
+			details: {},
+			terminate: true,
+		}),
+	}) as unknown as AgentTool;
+
 const answer = (text: string) => assistant([{ type: "text", text }]);
 
 /** Every tool result must follow the assistant message that asked for it, exactly once. */
@@ -725,6 +739,17 @@ describe("AgentSession: settling an interrupted turn", () => {
 			.getBranch()
 			.flatMap((e) => (e.type === "custom_message" ? [contentText(e.content as never, "")] : []));
 		expect(notes).toEqual(["a", "b"]);
+	});
+
+	it("reads a turn its tools stopped as answered whatever the response's stop reason", async () => {
+		// An extension can replace the response with one that keeps its calls but says "stop".
+		const replies = [assistant([call("stop-1")], "stop"), answer("never")];
+		await createSession(replies, undefined, { do: stopTool() });
+
+		await session.prompt("go");
+		expect(modelCalls).toBe(1);
+		expect(session.agent.state.messages.at(-1)?.role).toBe("toolResult");
+		expect(session.prepareStep()).toBe(false);
 	});
 
 	it("reads a turn its tools stopped as answered, also after a reopen", async () => {

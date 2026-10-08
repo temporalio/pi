@@ -1928,10 +1928,11 @@ export class AgentSession {
 		// The transcript alone can end on a result for other reasons. A reply that overflowed is
 		// omitted before recovery, and if recovery fails, an earlier step's result is left at
 		// the tail. Only the run's last response asking for this call means its tools ended it.
+		// The loop runs the calls a response holds, whatever its stop reason says, and a finished
+		// run stops on their results only when the tools end it. So the stop reason isn't asked.
 		const final = this._runFinalResponse;
-		const askedFor =
-			final?.stopReason === "toolUse" &&
-			final.content.some((block) => block.type === "toolCall" && block.id === last.toolCallId);
+		const callId = last.toolCallId;
+		const askedFor = final?.content.some((block) => block.type === "toolCall" && block.id === callId);
 		if (!askedFor) return;
 		const messageEntryId = this._findPersistedMessageEntryId(last);
 		if (!messageEntryId) return;
