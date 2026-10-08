@@ -830,6 +830,29 @@ describe("stepped turn", () => {
 		expect(notes).toHaveLength(1);
 	});
 
+	it("runs agent_before_settle once when its message became the tail before the seal ran again", async () => {
+		const extension = `export default p => p.on("agent_before_settle", () => {
+			globalThis.reopenedSettles = (globalThis.reopenedSettles ?? 0) + 1;
+			return { entries: [{ type: "custom_message", customType: "settle-note", content: "noted", display: false }] };
+		});`;
+		delete testGlobals.reopenedSettles;
+		const responses = [assistant([{ type: "text", text: "answer" }])];
+		const first = await createSession("settled-message", { responses, extension });
+		await first.session.recordPrompt("go");
+		const { stepId } = await first.session.modelCall();
+		expect((await first.session.sealStep([], { stepId })).done).toBe(true);
+
+		const again = await reopen(first, "settled-message-again", { responses, extension });
+		expect((await again.session.sealStep([], { stepId })).done).toBe(true);
+
+		expect(testGlobals.reopenedSettles).toBe(1);
+		delete testGlobals.reopenedSettles;
+		const notes = SessionManager.open(first.sessionManager.getSessionFile()!)
+			.getBranch()
+			.filter((entry) => entry.type === "custom_message" && entry.customType === "settle-note");
+		expect(notes).toHaveLength(1);
+	});
+
 	it("continues as the first seal decided when a reopened seal runs again", async () => {
 		const extension = `export default p => {
 			p.on("turn_end", () => {

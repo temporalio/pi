@@ -407,7 +407,7 @@ function promptOptionChanges(
 
 // Names the message entry of a stepped turn whose `turn_end` boundary was dispatched.
 const TURN_END_DISPATCHED_ENTRY = "pi.turn-end-dispatched";
-// Names the last message entry of a stepped turn whose `agent_before_settle` boundary ran.
+// Names the last response of a stepped turn whose `agent_before_settle` boundary ran.
 const SETTLE_DISPATCHED_ENTRY = "pi.before-settle-dispatched";
 // Names a response a recovery took out of the context without scheduling another request, and
 // the counts its seal returned.
@@ -2664,10 +2664,12 @@ export class AgentSession {
 		// turn the user stopped, which still has work.
 		this._markTurnEndedOnResult();
 		// A seal that runs again ends the same turn again. The boundary already ran for it, and its
-		// entries are in the file, so running it again would add them twice.
-		const lastEntryId = last ? this._findPersistedMessageEntryId(last) : undefined;
-		if (last && this._findDispatch(SETTLE_DISPATCHED_ENTRY, last)) return true;
-		await this._runBeforeSettleBoundary(lastEntryId);
+		// entries are in the file, so running it again would add them twice. The marker names the
+		// step's response, because a message the boundary adds becomes the transcript's tail.
+		const step = this._findLastAssistantMessage() ?? last;
+		const stepEntryId = step ? this._findPersistedMessageEntryId(step) : undefined;
+		if (step && this._findDispatch(SETTLE_DISPATCHED_ENTRY, step)) return true;
+		await this._runBeforeSettleBoundary(stepEntryId);
 		return true;
 	}
 
@@ -2761,8 +2763,8 @@ export class AgentSession {
 	}
 
 	/**
-	 * `stepEntryId` names the last entry of a stepped turn. The boundary's entries and a marker
-	 * naming it then go in one write, so a seal that runs again can see the boundary already ran.
+	 * `stepEntryId` names the response of a stepped turn's last step. The boundary's entries and
+	 * a marker naming it then go in one write, so a seal that runs again can see the boundary ran.
 	 */
 	private async _runBeforeSettleBoundary(stepEntryId?: string): Promise<boolean> {
 		if (!this._extensionRunner.hasHandlers("agent_before_settle")) return this.agent.hasQueuedMessages();
