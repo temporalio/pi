@@ -5,9 +5,8 @@ import { Agent, type AgentMessage, type AgentTool } from "@earendil-works/pi-age
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	type AssistantMessage,
-	type AssistantMessageEvent,
 	contentText,
-	EventStream,
+	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxToolCall,
 	getCurrentSystemPrompt,
@@ -26,19 +25,6 @@ import type { ExtensionFactory } from "../src/index.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createHarness, getMessageText, getUserTexts } from "./suite/harness.ts";
 import { createTestResourceLoader } from "./utilities.ts";
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 const usage = {
 	input: 0,
@@ -152,7 +138,7 @@ describe("AgentSession: settling an interrupted turn", () => {
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
 			streamFn: () => {
-				const stream = new MockAssistantStream();
+				const stream = createAssistantMessageEventStream();
 				const message = replies[Math.min(modelCalls, replies.length - 1)];
 				modelCalls++;
 				void gate.then(() => {
