@@ -778,14 +778,13 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header before repairing the file.
+	// Validate session header before accepting the entries.
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
 		return [];
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
 	return dropIncompleteBatches(entries);
 }
 
@@ -1123,8 +1122,6 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	private _writeGuard?: () => void;
-	// A failed append may have left part of a line at the end of the file.
-	private _cutTail = false;
 	// Entries appended inside batch(), held for its single write.
 	private _batch?: SessionEntry[];
 	// The batch of each entry held in memory before the file exists. A reopened session then
@@ -1338,18 +1335,10 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			// An append that fails can leave part of its lines. The next append ends that part with
-			// a newline first, so the loader skips it as one bad line and reads the retry's lines
-			// whole. Never cut the file back. A writer the guard let through can still be in this
-			// write when a newer one appends, and a cut would erase what the newer one wrote.
-			const prefix = this._cutTail ? "\n" : "";
-			try {
-				appendFileSync(this.sessionFile, `${prefix}${lines}`);
-			} catch (error) {
-				this._cutTail = true;
-				throw error;
-			}
-			this._cutTail = false;
+			// A superseded writer can leave a cut line after this session opened or last wrote.
+			// Always end it first, so every complete entry (including a batch's first) loads whole.
+			// Never cut the file back: that could erase what a newer writer already appended.
+			appendFileSync(this.sessionFile, `\n${lines}`);
 		}
 	}
 

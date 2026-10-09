@@ -48,7 +48,8 @@ vi.mock("node:fs", async (importOriginal) => {
 				// A short write: the first line lands, then the process is gone before the rest.
 				state.dieInNextAppend = false;
 				const text = String(args[1]);
-				actual.appendFileSync(args[0], text.slice(0, text.indexOf("\n") + 1));
+				// The append may start with a separator; cut after the first entry, not that blank line.
+				actual.appendFileSync(args[0], text.slice(0, text.indexOf("\n", text.startsWith("\n") ? 1 : 0) + 1));
 				throw new Error("process died");
 			}
 			return actual.appendFileSync(...args);
