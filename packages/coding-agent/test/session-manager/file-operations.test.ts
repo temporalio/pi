@@ -92,7 +92,8 @@ describe("loadEntriesFromFile", () => {
 		expect(entries).toHaveLength(2);
 	});
 
-	// Loading cannot write before a write guard is installed.
+	// loadEntriesFromFile() only reads. A session loads before its write guard can be set, so a
+	// write here would bypass the guard.
 	it("reads an unterminated valid record without modifying the file", () => {
 		const file = join(tempDir, "unterminated.jsonl");
 		const content =
@@ -102,6 +103,23 @@ describe("loadEntriesFromFile", () => {
 
 		expect(loadEntriesFromFile(file)).toHaveLength(2);
 		expect(readFileSync(file, "utf8")).toBe(content);
+	});
+
+	// #8345: a resumed session keeps its unterminated last record and the entry appended after it.
+	it("keeps an unterminated valid record and the next appended entry", () => {
+		const file = join(tempDir, "unterminated-resume.jsonl");
+		// A current version, so no migration rewrites the file on open and ends the line first.
+		writeFileSync(
+			file,
+			'{"type":"session","version":3,"id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' +
+				'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"hi","timestamp":1}}',
+		);
+
+		const session = SessionManager.open(file, tempDir);
+		session.appendMessage(assistantMsg("hello"));
+
+		expect(readSessionFileRoles(file)).toEqual(["session", "user", "assistant"]);
+		expect(SessionManager.open(file, tempDir).getEntries()).toEqual(session.getEntries());
 	});
 
 	it("skips an unterminated malformed final fragment without modifying the file", () => {

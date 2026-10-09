@@ -785,6 +785,8 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		return [];
 	}
 
+	// An unterminated last line stays as it is. A session loads before its write guard can be set,
+	// so ending the line here would write past the guard. The next append starts with a newline.
 	return dropIncompleteBatches(entries);
 }
 
@@ -1337,6 +1339,8 @@ export class SessionManager {
 		} else {
 			// A superseded writer can leave a cut line after this session opened or last wrote.
 			// Always end it first, so every complete entry (including a batch's first) loads whole.
+			// This relies on the append landing in one write. A short write, or a file system without
+			// atomic appends, can still let another writer's bytes in between.
 			// Never cut the file back: that could erase what a newer writer already appended.
 			appendFileSync(this.sessionFile, `\n${lines}`);
 		}
