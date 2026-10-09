@@ -1,0 +1,119 @@
+name: Temporal packages
+
+# Rehearses the manual release in `TEMPORAL.md` without publishing. It rewrites the agent core
+# and coding agent for `@temporalio`, packs them, installs the tarballs in a fresh project and
+# checks what pi-temporal uses. Path filters do not apply to tag pushes, so every
+# `pi-temporal-v*` tag runs it.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - packages/agent/**
+      - packages/coding-agent/**
+      - scripts/temporal-publish.mjs
+      - .github/workflows/temporal-package.yml
+  push:
+    branches: [main]
+    tags: ["pi-temporal-v*"]
+    paths:
+      - packages/agent/**
+      - packages/coding-agent/**
+      - scripts/temporal-publish.mjs
+      - .github/workflows/temporal-package.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporal-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      # A tag rehearses its own version. Other runs only need a valid one.
+      - name: Rewrite the packages for @temporalio
+        run: |
+          version=0.0.0
+          case "$GITHUB_REF" in
+            refs/tags/pi-temporal-v*) version="${GITHUB_REF#refs/tags/pi-temporal-v}" ;;
+          esac
+          node scripts/temporal-publish.mjs "$version"
+
+      - name: Pack the packages
+        run: |
+          mkdir "$RUNNER_TEMP/pack"
+          for dir in packages/agent packages/coding-agent; do
+            (cd "$dir" && npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/pack")
+          done
+
+      # The alias target is not on npm yet, so an override points it at the agent core tarball.
+      # The project depends on the coding agent alone, as a pi-temporal user would.
+      - name: Install the tarballs in a fresh project
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir consumer
+          cd consumer
+          CORE="$(ls "$RUNNER_TEMP"/pack/temporalio-pi-agent-core-*.tgz)" \
+          CODING="$(ls "$RUNNER_TEMP"/pack/temporalio-pi-coding-agent-*.tgz)" \
+          node -e '
+            const manifest = {
+              name: "consumer",
+              private: true,
+              type: "module",
+              dependencies: { "@temporalio/pi-coding-agent": `file:${process.env.CODING}` },
+              overrides: { "@earendil-works/pi-agent-core": `file:${process.env.CORE}` },
+            };
+            require("node:fs").writeFileSync("package.json", JSON.stringify(manifest, null, 2));
+          '
+          npm install --no-audit --no-fund
+
+      - name: Check the installed packages
+        working-directory: ${{ runner.temp }}/consumer
+        run: |
+          npm ls @earendil-works/pi-agent-core
+          copies="$(find node_modules -type d -name pi-agent-core | wc -l)"
+          if [ "$copies" -ne 1 ]; then
+            echo "Expected one copy of pi-agent-core, found $copies"
+            exit 1
+          fi
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const core = "node_modules/@earendil-works/pi-agent-core/package.json";
+            const { name } = JSON.parse(readFileSync(core, "utf8"));
+            if (name !== "@temporalio/pi-agent-core") throw new Error(`${core} is ${name}`);
+            const coding = await import("@temporalio/pi-coding-agent");
+            const { AgentSession, createAgentSession } = coding;
+            if (typeof createAgentSession !== "function") throw new Error("No createAgentSession");
+            for (const step of ["prepareStep", "modelCall", "runToolCall", "sealStep"]) {
+              if (typeof AgentSession.prototype[step] !== "function") {
+                throw new Error(`AgentSession.prototype.${step} is missing`);
+              }
+            }
+          '
+          manifest=node_modules/@temporalio/pi-coding-agent/package.json
+          expected="$(node -p "require('./$manifest').version")"
+          actual="$(./node_modules/.bin/pi --version)"
+          if [ "$actual" != "$expected" ]; then
+            echo "pi --version printed $actual, expected $expected"
+            exit 1
+          fi
+          echo "pi $actual loads, has the step API and one copy of pi-agent-core"
