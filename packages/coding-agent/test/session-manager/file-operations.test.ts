@@ -92,7 +92,7 @@ describe("loadEntriesFromFile", () => {
 		expect(entries).toHaveLength(2);
 	});
 
-	// temporalio/pi-temporal#51: loading cannot write before a write guard is installed.
+	// Loading cannot write before a write guard is installed.
 	it("reads an unterminated valid record without modifying the file", () => {
 		const file = join(tempDir, "unterminated.jsonl");
 		const content =

@@ -1,6 +1,8 @@
 # Session File Format
 
-Sessions are stored as JSONL (JSON Lines) files. Each line is a JSON object with a `type` field. Session entries form a tree structure via `id`/`parentId` fields, enabling in-place branching without creating new files.
+Sessions are stored as newline-delimited JSON records in `.jsonl` files. Each entry is a JSON object with a `type` field. Session entries form a tree structure via `id`/`parentId` fields, enabling in-place branching without creating new files.
+
+Blank separator lines can appear between entries and must be skipped by readers. Files with these separators are not strict JSON Lines. Each append to an existing file starts with a newline so that a torn line left by another writer cannot join the next complete entry. Checking the last byte first would leave a gap in which that writer could still append a torn line.
 
 For programmatic creation, persistence, and tree navigation, see the [`SessionManager` API](sdk.md#sessionmanager-api).
 
@@ -249,12 +251,15 @@ The compaction summary replaces entries before `firstKeptEntryId`. Pre-compactio
 
 ## Parsing Example
 
+This example reads complete records and skips blank separators. For recovery from interrupted writes and incomplete batches, use the `SessionManager` API.
+
 ```typescript
 import { readFileSync } from "fs";
 
 const lines = readFileSync("session.jsonl", "utf8").trim().split("\n");
 
 for (const line of lines) {
+  if (!line.trim()) continue;
   const entry = JSON.parse(line);
 
   switch (entry.type) {

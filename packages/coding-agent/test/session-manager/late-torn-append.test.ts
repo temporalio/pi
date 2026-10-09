@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-// temporalio/pi-temporal#51: a superseded writer can leave a torn line after another manager
+// A superseded writer can leave a torn line after another manager
 // opened the session, even after its write guard passes. Every later append must end that line
 // without rewriting earlier bytes. A complete batch must reload with every entry, not be
 // discarded as incomplete because its first line joined the stale fragment.
@@ -45,7 +45,7 @@ describe("SessionManager: a late torn append", () => {
 			}
 			expect.soft(guards).toBe(mode === "batch" ? 3 : 1);
 			expect.soft(readFileSync(file, "utf8").startsWith(before + cut)).toBe(true);
-			// Soft assertions keep the second cut exercised on the unfixed code too.
+			// Soft, so the second cut still runs when the first one fails.
 			expect.soft(SessionManager.open(file).getEntries()).toEqual(current.getEntries());
 		}
 	});
