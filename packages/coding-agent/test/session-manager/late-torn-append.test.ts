@@ -50,7 +50,7 @@ describe("SessionManager: a late torn append", () => {
 		}
 	});
 
-	it("opens a torn current-version session without writing, then requires a guard to append", () => {
+	it("opens a torn current-version session without writing, then checks the guard before appending", () => {
 		const seed = SessionManager.create(dir, dir);
 		seed.appendMessage({ role: "user", content: "seed", timestamp: 1 });
 		const file = seed.getSessionFile()!;
