@@ -160,6 +160,7 @@ export function readSessionFileRoles(file: string): string[] {
 	return readFileSync(file, "utf-8")
 		.trim()
 		.split("\n")
+		.filter((line) => line.trim().length > 0)
 		.map((line) => {
 			const record = JSON.parse(line);
 			return record.message?.role ?? record.type;
